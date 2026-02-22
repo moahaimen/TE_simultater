@@ -1,0 +1,21 @@
+dataset:
+  key: geant
+  name: GEANT
+  data_dir: data
+  processed_file: geant.npz
+  dynamic_archive: directed-geant-uhlig-15min-over-4months-ALL-native.tgz
+  topology_file: geant.txt
+
+experiment:
+  seed: 42
+  max_steps: 500
+  k_paths: 3
+  k_crit: 40
+  split:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+  lp_time_limit_sec: 20
+  full_mcf_time_limit_sec: 120
+  include_lp_optimal: false
+  include_rl: false

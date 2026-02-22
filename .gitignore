@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Local data and generated artifacts
+data/raw/
+data/extracted/
+data/processed/
+results/*
+!results/.gitkeep
+!results/report.md
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
