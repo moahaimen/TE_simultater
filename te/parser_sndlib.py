@@ -135,16 +135,43 @@ def parse_native_topology(topology_file: Path | str) -> TopologyData:
         link_id, src, dst, rest = match.groups()
         nums = _extract_numbers(rest)
 
-        # SNDlib native link layout starts with pre-installed capacity.
-        capacity = float(nums[0]) if len(nums) >= 1 else float("nan")
+        # SNDlib native link layout:
+        # [pre_capacity, pre_cost, routing_cost, setup_cost, module_capacity_1, module_cost_1, ...]
+        pre_capacity = float(nums[0]) if len(nums) >= 1 else float("nan")
+        module_caps = [float(x) for x in nums[4::2]] if len(nums) >= 5 else []
+        module_caps = [x for x in module_caps if x > 0]
 
-        # Routing cost is typically the 3rd numeric item in native link lines.
-        weight = float(nums[2]) if len(nums) >= 3 and nums[2] > 0 else 1.0
+        if pre_capacity > 0:
+            capacity = pre_capacity
+        elif module_caps:
+            # Many SNDlib topologies encode capacity only in module entries (e.g., GEANT).
+            capacity = float(max(module_caps))
+        else:
+            positive_any = [float(x) for x in nums if x > 0]
+            capacity = float(max(positive_any)) if positive_any else float("nan")
+
+        # Routing cost is typically the 3rd numeric item; if zero/missing, use setup cost.
+        if len(nums) >= 3 and nums[2] > 0:
+            weight = float(nums[2])
+        elif len(nums) >= 4 and nums[3] > 0:
+            weight = float(nums[3])
+        else:
+            weight = 1.0
 
         raw_links.append((link_id, src, dst, capacity, weight))
 
     if not raw_links:
         raise ValueError(f"No links parsed from topology file: {topology_file}")
+
+    # SNDlib topology links are often listed once (undirected physical link).
+    # Add reverse directed arcs when missing so directed TMs remain routable.
+    existing_pairs = {(src, dst) for _, src, dst, _, _ in raw_links}
+    augmented = list(raw_links)
+    for link_id, src, dst, cap, wt in raw_links:
+        if (dst, src) not in existing_pairs:
+            augmented.append((f"{link_id}__rev", dst, src, cap, wt))
+            existing_pairs.add((dst, src))
+    raw_links = augmented
 
     capacities = np.array([item[3] for item in raw_links], dtype=float)
     capacities, normalization_rule = _normalize_capacities(capacities)
