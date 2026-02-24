@@ -204,6 +204,7 @@ def parse_native_demand_snapshot(tm_file: Path | str) -> Dict[Tuple[str, str], f
     if demands_section is None:
         raise ValueError(f"Missing DEMANDS section in {tm_file}")
 
+    # Snapshot is sparse in practice; we keep a map first and densify later.
     demands: Dict[Tuple[str, str], float] = {}
     for line in _iter_clean_lines(demands_section):
         match = ENTRY_RE.match(line)
@@ -305,6 +306,8 @@ def build_tm_matrix(
     selected_files = list(tm_files)
     od_to_idx = {od: idx for idx, od in enumerate(od_pairs)}
 
+    # We materialize a dense matrix [time, od]. Any missing OD in a snapshot
+    # is interpreted as zero demand for that timestep.
     tm = np.zeros((len(selected_files), len(od_pairs)), dtype=np.float32)
     for t_idx, tm_file in enumerate(selected_files):
         snapshot = parse_native_demand_snapshot(tm_file)

@@ -111,12 +111,17 @@ def load_dataset(config: Dict[str, object], max_steps: Optional[int] = None) -> 
 
     od_src = [str(x) for x in payload["od_src"].tolist()]
     od_dst = [str(x) for x in payload["od_dst"].tolist()]
+    # OD pairs are stored explicitly as directed source-destination tuples.
+    # TM column j always corresponds to od_pairs[j].
     od_pairs = list(zip(od_src, od_dst))
 
+    # tm has shape [T, |OD|]: each row is one timestep snapshot,
+    # each column is one directed OD demand series.
     tm = payload["tm"].astype(float)
     if max_steps is None:
         max_steps = exp_cfg.get("max_steps")
     if max_steps is not None:
+        # We keep chronological order and truncate only the tail.
         tm = tm[: int(max_steps)]
 
     split_cfg = exp_cfg.get("split", {})
@@ -187,6 +192,8 @@ def build_paths(
     force_rebuild: bool = False,
 ) -> PathLibrary:
     """Build K-shortest paths and cache them for repeat runs."""
+    # K is the number of candidate paths per OD exposed to the optimizer.
+    # Caching avoids recomputing these paths in repeated experiments.
     if cache_dir is None:
         cache_dir = dataset.processed_path.parent / "path_cache"
     cache_dir = Path(cache_dir)
@@ -248,6 +255,8 @@ def apply_routing(
         if split_sum <= 0:
             continue
 
+        # Each OD demand is split over its K candidate paths.
+        # We then accumulate the resulting path flows onto traversed links.
         normalized = split_vec / split_sum
         for path_idx, frac in enumerate(normalized):
             if frac <= 0:
@@ -257,6 +266,8 @@ def apply_routing(
                 link_loads[edge_idx] += flow
 
     utilization = link_loads / np.maximum(capacities, 1e-12)
+    # MLU is dimensionless: max_e(load_e / capacity_e).
+    # Lower MLU means better load balancing and lower peak congestion.
     mlu = float(np.max(utilization)) if utilization.size else 0.0
     mean_utilization = float(np.mean(utilization)) if utilization.size else 0.0
 

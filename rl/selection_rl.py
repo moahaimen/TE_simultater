@@ -23,6 +23,8 @@ EPS = 1e-12
 
 @dataclass
 class SelectionRLConfig:
+    # Kcrit is a fixed-size control budget: how many OD pairs can be re-optimized
+    # at each timestep. Membership is dynamic, cardinality is fixed.
     k_crit: int
     lr: float = 1e-3
     hidden_dim: int = 128
@@ -244,6 +246,8 @@ def _evaluate(
         active_mask = torch.tensor(step_tm > 0, dtype=torch.bool, device=device)
         selected = _deterministic_topk(scores, active_mask, cfg.k_crit)
 
+        # rl_lp_selection action = choose critical ODs, not paths.
+        # LP then computes path split ratios for those selected ODs only.
         t_start = time.perf_counter()
         lp = solve_selected_path_lp(
             tm_vector=step_tm,
@@ -453,6 +457,8 @@ def train_selection_rl(
             selected_t, log_prob, entropy = _sample_topk(scores, active_mask, cfg.k_crit)
             selected = [int(x) for x in selected_t.detach().cpu().tolist()]
 
+            # During training, the policy samples a Kcrit-sized OD set.
+            # The LP stage translates that set into continuous path-split decisions.
             lp = solve_selected_path_lp(
                 tm_vector=step_tm,
                 selected_ods=selected,
@@ -484,6 +490,8 @@ def train_selection_rl(
             curr_set = set(selected)
             change_count = len(curr_set.symmetric_difference(prev_selected_set))
 
+            # Reward balances congestion and operational stability.
+            # Lower MLU is preferred, with penalties for churn across timesteps.
             reward = (
                 -float(lp.routing.mlu)
                 - cfg.alpha_disturbance * float(disturbance)

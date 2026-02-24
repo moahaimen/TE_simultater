@@ -37,6 +37,9 @@ def _build_background_load(
     selected_set: set[int],
     num_edges: int,
 ) -> np.ndarray:
+    # In the hybrid setup, only selected ODs are re-optimized.
+    # Non-selected ODs remain fixed (usually ECMP), and their traffic is treated
+    # as immutable background load in the LP constraints.
     load = np.zeros(num_edges, dtype=float)
     for od_idx, demand in enumerate(tm_vector):
         if demand <= 0 or od_idx in selected_set:
@@ -92,6 +95,7 @@ def solve_selected_path_lp(
     background = _build_background_load(tm_vector, base_splits, path_library, selected_set, num_edges)
 
     model = pulp.LpProblem("hybrid_te_selected_lp", pulp.LpMinimize)
+    # U is the MLU surrogate variable shared by all link constraints.
     U = pulp.LpVariable("U", lowBound=0.0)
 
     flow_vars: Dict[Tuple[int, int], pulp.LpVariable] = {}
@@ -105,20 +109,25 @@ def solve_selected_path_lp(
 
         per_od_vars = []
         for path_idx, edge_path in enumerate(paths):
+            # f_od,path is the traffic amount assigned to one candidate path.
             var = pulp.LpVariable(f"f_{od_idx}_{path_idx}", lowBound=0.0)
             flow_vars[(od_idx, path_idx)] = var
             per_od_vars.append(var)
             for edge_idx in edge_path:
                 incidence[edge_idx].append(var)
 
+        # Flow conservation at OD level: all demand of this OD must be routed.
         model += pulp.lpSum(per_od_vars) == demand, f"demand_{od_idx}"
 
     for edge_idx in range(num_edges):
+        # Link capacity with background load already present:
+        # background + optimized selected traffic <= U * capacity.
         model += (
             background[edge_idx] + pulp.lpSum(incidence[edge_idx]) <= U * float(capacities[edge_idx]),
             f"cap_{edge_idx}",
         )
 
+    # Minimize U, i.e., minimize the worst link utilization (MLU).
     model += U
 
     solver = pulp.PULP_CBC_CMD(msg=solver_msg, timeLimit=int(time_limit_sec), threads=1)
@@ -166,6 +175,9 @@ def solve_full_mcf_min_mlu(
     solver_msg: bool = False,
 ) -> FullMCFResult:
     """Full multi-commodity flow LP minimizing MLU (M2 reference)."""
+    # This is the global oracle baseline: all active ODs are optimized jointly
+    # on the full edge graph (no K-path restriction). We use it as an upper
+    # bound for achievable MLU, not as a practical online controller.
     active_ods = [idx for idx, demand in enumerate(tm_vector) if demand > 0]
     num_edges = len(edges)
 
@@ -212,6 +224,7 @@ def solve_full_mcf_min_mlu(
             elif node == dst:
                 rhs = -demand
 
+            # Standard flow conservation per commodity at each node.
             model += out_flow - in_flow == rhs, f"flow_{od_idx}_{node}"
 
     model += U

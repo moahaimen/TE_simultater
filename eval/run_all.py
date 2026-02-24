@@ -110,6 +110,7 @@ def run_method(
     test_start = dataset.split["test_start"]
 
     for t_idx in range(dataset.tm.shape[0]):
+        # tm_vector is one row from TM[T, |OD|]: demand snapshot at time t.
         tm_vector = dataset.tm[t_idx]
 
         if method == "ospf":
@@ -123,6 +124,7 @@ def run_method(
             status = "Static"
 
         elif method == "topk":
+            # Kcrit: fixed-size budget of ODs that are allowed to deviate from ECMP at this timestep.
             selected = select_topk_by_demand(tm_vector, k_crit=k_crit)
             lp = solve_selected_path_lp(
                 tm_vector=tm_vector,
@@ -182,7 +184,9 @@ def run_method(
             features = build_od_features(tm_vector, shortest_costs, prev_selected).to(device)
             with torch.no_grad():
                 scores = rl_policy(features).cpu()
+            # RL action is OD selection only. It does not pick a path directly.
             selected = deterministic_topk(scores, k=k_crit).tolist()
+            # LP receives the selected OD set and returns optimal split ratios over K paths.
             lp = solve_selected_path_lp(
                 tm_vector=tm_vector,
                 selected_ods=selected,
@@ -265,7 +269,9 @@ def main() -> None:
         dataset = load_dataset(config, max_steps=args.max_steps)
         exp_cfg = config.get("experiment", {}) if isinstance(config.get("experiment"), dict) else {}
 
+        # K = number of candidate paths per OD (default 3).
         k_paths = int(args.k_paths if args.k_paths is not None else exp_cfg.get("k_paths", 3))
+        # Kcrit = fixed critical-flow budget per timestep, dynamic membership.
         k_crit = int(args.k_crit if args.k_crit is not None else exp_cfg.get("k_crit", 20))
         lp_time_limit_sec = int(
             args.lp_time_limit_sec if args.lp_time_limit_sec is not None else exp_cfg.get("lp_time_limit_sec", 20)

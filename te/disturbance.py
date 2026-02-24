@@ -21,6 +21,7 @@ def compute_disturbance(
         return 0.0
 
     if prev_splits is None:
+        # At t=0 there is no previous routing state, so disturbance is defined as zero.
         return 0.0
 
     changed = 0.0
@@ -41,7 +42,12 @@ def compute_disturbance(
         prev_pad[: prev_vec.size] = prev_vec
         curr_pad[: curr_vec.size] = curr_vec
 
+        # L1 distance counts changed probability mass in both directions.
+        # Dividing by 2 converts it into the fraction of OD traffic that was
+        # effectively rerouted between path distributions.
         l1 = float(np.sum(np.abs(curr_pad - prev_pad)))
         changed += float(demand) * (l1 / 2.0)
 
+    # Demand-weighted normalization keeps the metric in [0, 1]
+    # and directly interpretable as rerouted traffic share.
     return changed / total_demand

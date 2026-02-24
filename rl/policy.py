@@ -26,6 +26,7 @@ class ODSelectorPolicy(nn.Module):
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         # features: [num_od, input_dim]
+        # Output is one scalar score per OD; higher means more critical.
         return self.net(features).squeeze(-1)
 
 
@@ -49,6 +50,9 @@ def build_od_features(
     else:
         prev_selected = np.asarray(prev_selected, dtype=float)
 
+    # The policy observes demand pressure, path difficulty, and previous
+    # selection state. This lets it keep a fixed Kcrit budget while still
+    # adapting membership of the critical OD set over time.
     features = np.stack([d_norm, c_norm, prev_selected], axis=1)
     return torch.tensor(features, dtype=torch.float32)
 
@@ -66,6 +70,8 @@ def sample_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tenso
     selected = []
     log_probs = []
 
+    # RL action here is OD-set selection, not direct path choice.
+    # The downstream LP decides per-path flow splits for selected ODs.
     for _ in range(k):
         masked = scores.masked_fill(~available, float("-inf"))
         dist = torch.distributions.Categorical(logits=masked)

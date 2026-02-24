@@ -14,6 +14,8 @@ ODPair = Tuple[str, str]
 class PathLibrary:
     """Candidate path library for all ODs."""
 
+    # This OD ordering is the contract used across the whole pipeline.
+    # TM columns, split vectors, and LP variables all refer to ODs by index.
     od_pairs: List[ODPair]
     node_paths_by_od: List[List[List[str]]]
     edge_paths_by_od: List[List[List[Tuple[str, str]]]]
@@ -39,6 +41,9 @@ def build_k_shortest_paths(
     k: int = 3,
 ) -> PathLibrary:
     """Build K-shortest simple paths for each OD pair."""
+    # K is the candidate-path budget per OD pair (default K=3).
+    # This keeps the action space and LP size bounded while preserving
+    # enough routing diversity to move traffic away from bottlenecks.
     if k <= 0:
         raise ValueError("k must be >= 1")
 
@@ -48,6 +53,8 @@ def build_k_shortest_paths(
     costs_by_od: List[List[float]] = []
 
     for src, dst in od_pairs:
+        # OD pairs are directed (src -> dst). We treat each OD independently
+        # during path enumeration, then couple them later in the LP via links.
         if src == dst:
             node_paths_by_od.append([])
             edge_paths_by_od.append([])
@@ -63,6 +70,8 @@ def build_k_shortest_paths(
             continue
 
         od_node_paths: List[List[str]] = []
+        # shortest_simple_paths yields paths in non-decreasing cost order,
+        # so truncating at K gives deterministic top-K alternatives per OD.
         for candidate in nx.shortest_simple_paths(graph, src, dst, weight="weight"):
             od_node_paths.append(list(candidate))
             if len(od_node_paths) >= k:

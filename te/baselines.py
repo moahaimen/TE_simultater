@@ -50,6 +50,8 @@ def ecmp_splits(path_library: PathLibrary, tol: float = 1e-9) -> List[np.ndarray
 
 def select_topk_by_demand(tm_vector: np.ndarray, k_crit: int) -> List[int]:
     """M3 selector: top-K OD pairs by current demand."""
+    # Kcrit is a fixed control budget per timestep.
+    # This selector simply allocates that budget to the largest active demands.
     if k_crit <= 0:
         return []
 
@@ -105,6 +107,8 @@ def select_bottleneck_critical(
     if mlu <= EPS:
         return []
 
+    # ODs are ranked by how strongly they load links near the current MLU.
+    # This is still bounded by Kcrit, so we preserve a fixed-size action budget.
     weights = util / mlu
     scored = []
     for od_idx, demand in enumerate(tm_vector):

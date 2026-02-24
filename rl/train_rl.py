@@ -63,6 +63,8 @@ def evaluate_policy(
             scores = policy(feat).cpu()
             selected = deterministic_topk(scores, k_crit).tolist()
 
+            # The policy action is selecting exactly Kcrit OD pairs.
+            # LP then computes split ratios over K candidate paths for those ODs.
             lp_result = solve_selected_path_lp(
                 tm_vector=step_tm,
                 selected_ods=selected,
@@ -91,7 +93,10 @@ def main() -> None:
     dataset = load_dataset(config, max_steps=args.max_steps)
     exp_cfg: Dict[str, object] = config.get("experiment", {}) if isinstance(config.get("experiment"), dict) else {}
 
+    # K controls the candidate-path budget per OD (default K=3).
     k_paths = int(exp_cfg.get("k_paths", 3))
+    # Kcrit is the fixed critical-flow budget per timestep.
+    # Membership changes over time, but set size stays fixed.
     k_crit = int(args.k_crit if args.k_crit is not None else exp_cfg.get("k_crit", 20))
     lp_time_limit_sec = int(args.lp_time_limit_sec)
 
@@ -134,6 +139,7 @@ def main() -> None:
                 time_limit_sec=lp_time_limit_sec,
             )
 
+            # We optimize congestion directly through negative MLU reward.
             reward = -float(lp_result.routing.mlu)
             baseline = args.baseline_momentum * baseline + (1.0 - args.baseline_momentum) * reward
             advantage = reward - baseline
