@@ -29,3 +29,8 @@ experiment:
   ppo_alpha: 0.2
   ppo_gamma_stretch: 0.02
   ppo_top_n_ods: 20
+
+  phase2:
+    predictor: ar_ridge
+    predictor_window: 6
+    predictor_alpha: 0.01
