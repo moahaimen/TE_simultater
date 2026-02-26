@@ -8,6 +8,7 @@ dataset:
 
 experiment:
   seed: 42
+  seeds: [42, 43, 44, 45, 46]
   max_steps: 500
   k_paths: 3
   k_crit: 20
