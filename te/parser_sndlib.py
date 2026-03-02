@@ -23,6 +23,10 @@ DATASET_SPECS = {
         "dynamic_archive": "directed-geant-uhlig-15min-over-4months-ALL-native.tgz",
         "topology_file": "geant.txt",
     },
+    "germany50": {
+        "dynamic_archive": "directed-germany50-DFN-aggregated-5min-over-1day-native.tgz",
+        "topology_file": "germany50.txt",
+    },
 }
 
 

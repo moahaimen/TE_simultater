@@ -2,12 +2,12 @@
 set -euo pipefail
 
 DATA_DIR="data"
-DATASETS_CSV="abilene,geant"
+DATASETS_CSV="abilene,geant,germany50"
 SKIP_EXISTING=1
 
 usage() {
   cat <<USAGE
-Usage: $0 [--data_dir PATH] [--datasets abilene,geant] [--force]
+Usage: $0 [--data_dir PATH] [--datasets abilene,geant,germany50] [--force]
 
 Downloads required SNDlib dynamic TM archives and native topology files.
 USAGE
@@ -17,6 +17,7 @@ dataset_archive() {
   case "$1" in
     abilene) echo "directed-abilene-zhang-5min-over-6months-ALL-native.tgz" ;;
     geant) echo "directed-geant-uhlig-15min-over-4months-ALL-native.tgz" ;;
+    germany50) echo "directed-germany50-DFN-aggregated-5min-over-1day-native.tgz" ;;
     *) return 1 ;;
   esac
 }
@@ -25,6 +26,7 @@ dataset_topology() {
   case "$1" in
     abilene) echo "abilene.txt" ;;
     geant) echo "geant.txt" ;;
+    germany50) echo "germany50.txt" ;;
     *) return 1 ;;
   esac
 }

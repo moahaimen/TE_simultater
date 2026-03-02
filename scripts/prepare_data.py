@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         default="all",
-        choices=["all", "abilene", "geant"],
+        choices=["all", "abilene", "geant", "germany50"],
         help="Dataset to prepare",
     )
     parser.add_argument(
