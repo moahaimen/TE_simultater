@@ -16,7 +16,7 @@ import pandas as pd
 import yaml
 
 from phase3.dataset_builder import build_one_phase3_dataset, load_topology_specs
-from phase3.eval_utils import run_methods_on_dataset
+from phase3.eval_utils import resolve_k_crit_settings, run_methods_on_dataset
 from te.scaling import apply_scale, compute_auto_scale_factor
 from te.simulator import build_paths, load_dataset
 
@@ -25,7 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Phase-3 topology generalization evaluation")
     parser.add_argument("--config", default="configs/phase3_topologies.yaml")
     parser.add_argument("--output_dir", default="results/phase3_final")
-    parser.add_argument("--methods", default="ospf,ecmp,topk,bottleneck")
+    parser.add_argument("--methods", default="ospf,ecmp,topk,bottleneck,sensitivity")
+    parser.add_argument("--topology_keys", default="")
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--force_rebuild", action="store_true")
     return parser.parse_args()
@@ -33,6 +34,30 @@ def parse_args() -> argparse.Namespace:
 
 def _safe_name(text: str) -> str:
     return "".join(c if c.isalnum() or c in {"_", "-"} else "_" for c in text)
+
+
+def _parse_csv(text: str) -> list[str]:
+    return [x.strip() for x in str(text).split(",") if x.strip()]
+
+
+def _validate_topology_file(spec, workspace_root: Path) -> None:
+    path = Path(spec.topology_file)
+    if not path.is_absolute():
+        path = workspace_root / path
+    if path.exists():
+        return
+
+    if spec.source == "rocketfuel":
+        raise FileNotFoundError(
+            f"Missing Rocketfuel topology file: {spec.topology_file}\n"
+            "Please place it there and rerun."
+        )
+    if spec.source == "topologyzoo":
+        raise FileNotFoundError(
+            f"Missing TopologyZoo file: {spec.topology_file}\n"
+            "Please place it there and rerun."
+        )
+    raise FileNotFoundError(f"Missing topology file: {spec.topology_file}")
 
 
 def _plot_generalization(summary_df: pd.DataFrame, out_dir: Path) -> None:
@@ -46,14 +71,14 @@ def _plot_generalization(summary_df: pd.DataFrame, out_dir: Path) -> None:
             continue
 
         subset["plot_label"] = subset.apply(
-            lambda r: f"{r['topology_id']}\\n(|V|={int(r['num_nodes'])}, |E|={int(r['num_edges'])})",
+            lambda r: f"{r['display_name']}\\n(|V|={int(r['num_nodes'])}, |E|={int(r['num_edges'])})",
             axis=1,
         )
         pivot = subset.pivot_table(index="plot_label", columns="method", values="mean_mlu", aggfunc="mean")
         if pivot.empty:
             continue
 
-        ax = pivot.plot(kind="bar", figsize=(12.0, 5.8))
+        ax = pivot.plot(kind="bar", figsize=(13.0, 6.0))
         ax.set_ylabel("mean MLU")
         ax.set_xlabel("Topology")
         ax.set_title(f"Phase-3 Generalization mean MLU ({regime})")
@@ -75,10 +100,12 @@ def _write_report(summary_df: pd.DataFrame, out_path: Path) -> None:
         "topology_id",
         "display_name",
         "source",
+        "tm_source",
         "num_nodes",
         "num_edges",
         "regime",
         "method",
+        "k_crit_used",
         "mean_mlu",
         "p95_mlu",
         "mean_disturbance",
@@ -87,7 +114,7 @@ def _write_report(summary_df: pd.DataFrame, out_path: Path) -> None:
     lines.append("| " + " | ".join(cols) + " |")
     lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
 
-    for _, row in summary_df.sort_values(["regime", "topology_id", "mean_mlu"]).iterrows():
+    for _, row in summary_df.sort_values(["regime", "display_name", "mean_mlu"]).iterrows():
         lines.append(
             "| "
             + " | ".join(
@@ -96,10 +123,12 @@ def _write_report(summary_df: pd.DataFrame, out_path: Path) -> None:
                     str(row["topology_id"]),
                     str(row["display_name"]),
                     str(row["source"]),
+                    str(row["tm_source"]),
                     str(int(row["num_nodes"])),
                     str(int(row["num_edges"])),
                     str(row["regime"]),
                     str(row["method"]),
+                    str(int(row.get("k_crit_used", 0))),
                     f"{row['mean_mlu']:.6f}",
                     f"{row['p95_mlu']:.6f}",
                     f"{row['mean_disturbance']:.6f}",
@@ -122,7 +151,9 @@ def main() -> None:
     exp = cfg.get("experiment", {}) if isinstance(cfg.get("experiment"), dict) else {}
     mgm_cfg = cfg.get("mgm", {}) if isinstance(cfg.get("mgm"), dict) else {}
 
-    methods = [m.strip() for m in str(args.methods).split(",") if m.strip()]
+    methods = _parse_csv(args.methods)
+    selected_keys = set(_parse_csv(args.topology_keys))
+
     regimes = exp.get("regimes", {"C2": 1.3, "C3": 1.8})
     if not isinstance(regimes, dict) or not regimes:
         regimes = {"C2": 1.3, "C3": 1.8}
@@ -143,22 +174,23 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     specs = load_topology_specs(cfg)
+    if selected_keys:
+        specs = [s for s in specs if s.key in selected_keys]
+
+    for spec in specs:
+        _validate_topology_file(spec, workspace_root)
 
     summary_rows: list[dict[str, object]] = []
     timeseries_rows: list[dict[str, object]] = []
 
     for spec in specs:
-        try:
-            processed_path = build_one_phase3_dataset(
-                spec=spec,
-                data_dir=data_dir,
-                workspace_root=workspace_root,
-                mgm_cfg=mgm_cfg,
-                force_rebuild=args.force_rebuild,
-            )
-        except Exception as exc:
-            print(f"[WARN] Skipping topology {spec.key}: {exc}")
-            continue
+        processed_path = build_one_phase3_dataset(
+            spec=spec,
+            data_dir=data_dir,
+            workspace_root=workspace_root,
+            mgm_cfg=mgm_cfg,
+            force_rebuild=args.force_rebuild,
+        )
 
         for regime_name, target_mlu in regimes.items():
             dataset_cfg = {
@@ -179,8 +211,16 @@ def main() -> None:
 
             topology_id = spec.topology_id or str(dataset.metadata.get("topology_id") or spec.key)
             display_name = spec.display_name or str(dataset.metadata.get("display_name") or spec.key)
+            tm_source = spec.tm_source
             num_nodes = int(dataset.metadata.get("num_nodes", len(dataset.nodes)))
             num_edges = int(dataset.metadata.get("num_edges", len(dataset.edges)))
+
+            k_settings = resolve_k_crit_settings(
+                exp_cfg=exp,
+                spec=spec,
+                num_edges=num_edges,
+                num_ods=len(dataset.od_pairs),
+            )
 
             scale_factor, probe = compute_auto_scale_factor(
                 tm=dataset.tm,
@@ -201,10 +241,12 @@ def main() -> None:
                 lp_time_limit_sec=lp_time_limit_sec,
                 full_mcf_time_limit_sec=full_mcf_time_limit_sec,
                 capacity_fn=None,
+                k_crit_settings=k_settings,
             )
 
             for row in run.summary_rows:
                 row["source"] = spec.source
+                row["tm_source"] = tm_source
                 row["topology_id"] = topology_id
                 row["display_name"] = display_name
                 row["topology_file"] = spec.topology_file
@@ -214,10 +256,13 @@ def main() -> None:
                 row["target_mlu_train"] = float(target_mlu)
                 row["scale_factor"] = float(scale_factor)
                 row["baseline_probe_mean_mlu"] = float(probe.mean_mlu)
+                row["k_crit_mode"] = k_settings.mode
+                row["k_crit_initial"] = int(k_settings.initial)
                 summary_rows.append(row)
 
             for row in run.timeseries_rows:
                 row["source"] = spec.source
+                row["tm_source"] = tm_source
                 row["topology_id"] = topology_id
                 row["display_name"] = display_name
                 row["topology_file"] = spec.topology_file
@@ -226,6 +271,8 @@ def main() -> None:
                 row["regime"] = regime_name
                 row["target_mlu_train"] = float(target_mlu)
                 row["scale_factor"] = float(scale_factor)
+                row["k_crit_mode"] = k_settings.mode
+                row["k_crit_initial"] = int(k_settings.initial)
                 timeseries_rows.append(row)
 
     summary_df = pd.DataFrame(summary_rows)
@@ -248,6 +295,7 @@ def main() -> None:
         "k_paths": k_paths,
         "k_crit": k_crit,
         "max_steps": max_steps,
+        "topology_keys": [s.key for s in specs],
         "num_topologies_evaluated": int(summary_df["dataset"].nunique()) if not summary_df.empty else 0,
         "regimes": regimes,
     }

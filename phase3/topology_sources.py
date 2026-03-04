@@ -20,6 +20,8 @@ class ParsedTopology:
     capacities: np.ndarray
     weights: np.ndarray
     normalization_rule: str | None
+    source_graph_directed: bool | None = None
+    source_edge_count: int | None = None
 
 
 FLOAT_RE = re.compile(r"[-+]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][-+]?\d+)?")
@@ -71,6 +73,8 @@ def parse_sndlib_topology(topology_file: Path | str) -> ParsedTopology:
         capacities=capacities,
         weights=weights,
         normalization_rule=payload.normalization_rule,
+        source_graph_directed=True,
+        source_edge_count=len(payload.links),
     )
 
 
@@ -94,6 +98,7 @@ def parse_rocketfuel_topology(
     edges: list[tuple[str, str]] = []
     caps: list[float] = []
     wts: list[float] = []
+    raw_edge_count = 0
 
     for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = raw.split("#", 1)[0].strip()
@@ -113,6 +118,7 @@ def parse_rocketfuel_topology(
         edges.append((src, dst))
         caps.append(cap)
         wts.append(max(wt, 1e-6))
+        raw_edge_count += 1
 
         if not directed:
             edges.append((dst, src))
@@ -129,6 +135,8 @@ def parse_rocketfuel_topology(
         capacities=caps_arr,
         weights=np.asarray(wts, dtype=float),
         normalization_rule=rule,
+        source_graph_directed=bool(directed),
+        source_edge_count=int(raw_edge_count),
     )
 
 
@@ -158,6 +166,7 @@ def parse_topologyzoo_topology(
         g = g_simple
 
     directed = g.is_directed()
+    source_edge_count = int(g.number_of_edges())
 
     nodes = [str(n) for n in g.nodes()]
     edges: list[tuple[str, str]] = []
@@ -195,6 +204,8 @@ def parse_topologyzoo_topology(
         capacities=caps_arr,
         weights=np.asarray(wts, dtype=float),
         normalization_rule=rule,
+        source_graph_directed=bool(directed),
+        source_edge_count=source_edge_count,
     )
 
 

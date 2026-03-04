@@ -20,17 +20,20 @@ import pandas as pd
 import yaml
 
 from phase3.dataset_builder import build_one_phase3_dataset, load_topology_specs
+from phase3.eval_utils import RuntimeKCritController, resolve_k_crit_settings
 from te.baselines import (
     clone_splits,
     ecmp_splits,
     ospf_splits,
     project_edge_flows_to_k_path_splits,
     select_bottleneck_critical,
+    select_sensitivity_critical,
     select_topk_by_demand,
 )
 from te.disturbance import compute_disturbance
 from te.lp_solver import solve_full_mcf_min_mlu, solve_selected_path_lp
 from te.scaling import apply_scale, compute_auto_scale_factor
+from te.paths import build_k_shortest_paths
 from te.simulator import build_paths, load_dataset
 
 
@@ -38,7 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Phase-3 failure scenarios")
     parser.add_argument("--config", default="configs/phase3_topologies.yaml")
     parser.add_argument("--output_dir", default="results/phase3_final")
-    parser.add_argument("--methods", default="ospf,ecmp,topk,bottleneck")
+    parser.add_argument("--methods", default="ospf,ecmp,topk,bottleneck,sensitivity")
+    parser.add_argument("--topology_keys", default="")
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--regimes", default="C2,C3")
     parser.add_argument("--failure_types", default="removal,degradation")
@@ -56,11 +60,31 @@ def _safe_name(text: str) -> str:
 
 
 def _parse_csv(text: str) -> list[str]:
-    return [x.strip() for x in text.split(",") if x.strip()]
+    return [x.strip() for x in str(text).split(",") if x.strip()]
 
 
 def _parse_float_csv(text: str) -> list[float]:
-    return [float(x.strip()) for x in text.split(",") if x.strip()]
+    return [float(x.strip()) for x in str(text).split(",") if x.strip()]
+
+
+def _validate_topology_file(spec, workspace_root: Path) -> None:
+    path = Path(spec.topology_file)
+    if not path.is_absolute():
+        path = workspace_root / path
+    if path.exists():
+        return
+
+    if spec.source == "rocketfuel":
+        raise FileNotFoundError(
+            f"Missing Rocketfuel topology file: {spec.topology_file}\n"
+            "Please place it there and rerun."
+        )
+    if spec.source == "topologyzoo":
+        raise FileNotFoundError(
+            f"Missing TopologyZoo file: {spec.topology_file}\n"
+            "Please place it there and rerun."
+        )
+    raise FileNotFoundError(f"Missing topology file: {spec.topology_file}")
 
 
 def _build_graph(dataset) -> nx.DiGraph:
@@ -275,6 +299,26 @@ def _stretch_metric(tm_vector: np.ndarray, splits: list[np.ndarray], path_librar
     return 1.0 if den <= 0 else num / den
 
 
+def _build_path_library_for_capacities(dataset, capacities: np.ndarray, k_paths: int):
+    graph = nx.DiGraph()
+    for node in dataset.nodes:
+        graph.add_node(node)
+
+    edge_to_idx: dict[tuple[str, str], int] = {}
+    for edge_idx, (src, dst) in enumerate(dataset.edges):
+        if float(capacities[edge_idx]) <= 0.0:
+            continue
+        graph.add_edge(src, dst, weight=float(dataset.weights[edge_idx]))
+        edge_to_idx[(src, dst)] = int(edge_idx)
+
+    return build_k_shortest_paths(
+        graph=graph,
+        od_pairs=dataset.od_pairs,
+        edge_to_idx=edge_to_idx,
+        k=max(1, int(k_paths)),
+    )
+
+
 def _run_failure_methods_on_dataset(
     dataset,
     tm: np.ndarray,
@@ -284,60 +328,114 @@ def _run_failure_methods_on_dataset(
     lp_time_limit_sec: int,
     full_mcf_time_limit_sec: int,
     capacity_fn: Callable[[int], np.ndarray],
+    k_crit_settings,
+    failure_start_timestep: int,
+    k_paths: int,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     summary_rows: list[dict[str, object]] = []
     timeseries_rows: list[dict[str, object]] = []
 
     test_indices = list(range(dataset.split["test_start"], tm.shape[0]))
-    ecmp_base = ecmp_splits(path_library)
-    ospf_base = ospf_splits(path_library)
+
+    pre_failure_path_library = path_library
+    pre_ecmp_base = ecmp_splits(pre_failure_path_library)
+    pre_ospf_base = ospf_splits(pre_failure_path_library)
+
+    post_failure_caps = _normalize_capacity(capacity_fn(failure_start_timestep))
+    post_failure_path_library = _build_path_library_for_capacities(
+        dataset=dataset,
+        capacities=post_failure_caps,
+        k_paths=k_paths,
+    )
+    post_ecmp_base = ecmp_splits(post_failure_path_library)
 
     for method in methods:
         prev_splits = None
         method_rows: list[dict[str, object]] = []
+        controller = RuntimeKCritController(k_crit_settings)
 
         for test_step, t_idx in enumerate(test_indices):
             step_tm = tm[t_idx]
             capacities = _normalize_capacity(capacity_fn(t_idx))
             t0 = time.perf_counter()
+            k_crit_used = 0
+
+            post_failure_active = int(t_idx) >= int(failure_start_timestep)
+            adaptive_library = post_failure_path_library if post_failure_active else pre_failure_path_library
+            adaptive_ecmp = post_ecmp_base if post_failure_active else pre_ecmp_base
 
             if method == "ospf":
-                splits = clone_splits(ospf_base)
+                # Keep OSPF baseline fixed to pre-failure candidate paths.
+                routing_library = pre_failure_path_library
+                splits = clone_splits(pre_ospf_base)
                 status = "Static"
             elif method == "ecmp":
-                splits = clone_splits(ecmp_base)
+                # Keep ECMP baseline fixed to pre-failure candidate paths.
+                routing_library = pre_failure_path_library
+                splits = clone_splits(pre_ecmp_base)
                 status = "Static"
             elif method == "topk":
-                selected = select_topk_by_demand(step_tm, k_crit=k_crit)
+                routing_library = adaptive_library
+                k_crit_used = controller.current_value()
+                selected = select_topk_by_demand(step_tm, k_crit=k_crit_used)
+                lp_t0 = time.perf_counter()
                 lp = solve_selected_path_lp(
                     tm_vector=step_tm,
                     selected_ods=selected,
-                    base_splits=ecmp_base,
-                    path_library=path_library,
+                    base_splits=adaptive_ecmp,
+                    path_library=routing_library,
                     capacities=capacities,
                     time_limit_sec=lp_time_limit_sec,
                 )
+                controller.update(time.perf_counter() - lp_t0)
                 splits = lp.splits
                 status = lp.status
             elif method == "bottleneck":
+                routing_library = adaptive_library
+                k_crit_used = controller.current_value()
                 selected = select_bottleneck_critical(
                     tm_vector=step_tm,
-                    ecmp_policy=ecmp_base,
-                    path_library=path_library,
+                    ecmp_policy=adaptive_ecmp,
+                    path_library=routing_library,
                     capacities=capacities,
-                    k_crit=k_crit,
+                    k_crit=k_crit_used,
                 )
+                lp_t0 = time.perf_counter()
                 lp = solve_selected_path_lp(
                     tm_vector=step_tm,
                     selected_ods=selected,
-                    base_splits=ecmp_base,
-                    path_library=path_library,
+                    base_splits=adaptive_ecmp,
+                    path_library=routing_library,
                     capacities=capacities,
                     time_limit_sec=lp_time_limit_sec,
                 )
+                controller.update(time.perf_counter() - lp_t0)
+                splits = lp.splits
+                status = lp.status
+            elif method in {"sensitivity", "sens"}:
+                routing_library = adaptive_library
+                k_crit_used = controller.current_value()
+                selected = select_sensitivity_critical(
+                    tm_vector=step_tm,
+                    ecmp_policy=adaptive_ecmp,
+                    path_library=routing_library,
+                    capacities=capacities,
+                    k_crit=k_crit_used,
+                )
+                lp_t0 = time.perf_counter()
+                lp = solve_selected_path_lp(
+                    tm_vector=step_tm,
+                    selected_ods=selected,
+                    base_splits=adaptive_ecmp,
+                    path_library=routing_library,
+                    capacities=capacities,
+                    time_limit_sec=lp_time_limit_sec,
+                )
+                controller.update(time.perf_counter() - lp_t0)
                 splits = lp.splits
                 status = lp.status
             elif method == "lp_optimal":
+                routing_library = adaptive_library
                 full = solve_full_mcf_min_mlu(
                     tm_vector=step_tm,
                     od_pairs=dataset.od_pairs,
@@ -346,15 +444,15 @@ def _run_failure_methods_on_dataset(
                     capacities=capacities,
                     time_limit_sec=full_mcf_time_limit_sec,
                 )
-                splits = project_edge_flows_to_k_path_splits(full.edge_flows_by_od, path_library)
+                splits = project_edge_flows_to_k_path_splits(full.edge_flows_by_od, routing_library)
                 status = full.status
             else:
                 raise ValueError(f"Unsupported method '{method}'")
 
-            eval_out = _evaluate_effective_routing(step_tm, splits, path_library, capacities)
+            eval_out = _evaluate_effective_routing(step_tm, splits, routing_library, capacities)
             runtime_sec = time.perf_counter() - t0
             disturbance = compute_disturbance(prev_splits, eval_out["effective_splits"], step_tm)
-            stretch = _stretch_metric(step_tm, eval_out["effective_splits"], path_library)
+            stretch = _stretch_metric(step_tm, eval_out["effective_splits"], routing_library)
             prev_splits = clone_splits(eval_out["effective_splits"])
 
             row = {
@@ -372,6 +470,7 @@ def _run_failure_methods_on_dataset(
                 "disturbance": float(disturbance),
                 "stretch": float(stretch),
                 "runtime_sec": float(runtime_sec),
+                "k_crit_used": int(k_crit_used),
                 "solver_status": status,
             }
             method_rows.append(row)
@@ -380,6 +479,7 @@ def _run_failure_methods_on_dataset(
         arr_dist = np.asarray([r["disturbance"] for r in method_rows], dtype=float)
         arr_run = np.asarray([r["runtime_sec"] for r in method_rows], dtype=float)
         arr_stretch = np.asarray([r["stretch"] for r in method_rows], dtype=float)
+        arr_kcrit = np.asarray([r["k_crit_used"] for r in method_rows], dtype=float)
 
         summary_rows.append(
             {
@@ -388,6 +488,9 @@ def _run_failure_methods_on_dataset(
                 "mean_disturbance": float(np.mean(arr_dist)) if arr_dist.size else np.nan,
                 "mean_runtime_sec": float(np.mean(arr_run)) if arr_run.size else np.nan,
                 "mean_stretch": float(np.mean(arr_stretch)) if arr_stretch.size else np.nan,
+                "k_crit_used": int(round(float(np.mean(arr_kcrit)))) if arr_kcrit.size else 0,
+                "k_crit_used_min": int(np.min(arr_kcrit)) if arr_kcrit.size else 0,
+                "k_crit_used_max": int(np.max(arr_kcrit)) if arr_kcrit.size else 0,
                 "num_test_steps": int(len(method_rows)),
             }
         )
@@ -491,6 +594,9 @@ def _build_recovery_view(ts_df: pd.DataFrame) -> pd.DataFrame:
     group_cols = [
         "dataset",
         "source",
+        "tm_source",
+        "topology_id",
+        "display_name",
         "regime",
         "failure_type",
         "selection_rule",
@@ -515,11 +621,12 @@ def _build_recovery_view(ts_df: pd.DataFrame) -> pd.DataFrame:
 def _plot_failure_summary(summary_df: pd.DataFrame, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     for (regime, failure_type), group in summary_df.groupby(["regime", "failure_type"]):
-        pivot = group.pivot_table(index="method", columns="selection_rule", values="mean_mlu_reachable", aggfunc="mean")
+        pivot = group.pivot_table(index="display_name", columns="method", values="mean_mlu_reachable", aggfunc="mean")
         if pivot.empty:
             continue
-        ax = pivot.plot(kind="bar", figsize=(9.5, 5.0))
+        ax = pivot.plot(kind="bar", figsize=(12.0, 5.8))
         ax.set_ylabel("post-failure mean MLU (reachable only)")
+        ax.set_xlabel("Topology")
         ax.set_title(f"Failure Impact: regime={regime}, type={failure_type}")
         ax.grid(axis="y", alpha=0.25)
         plt.tight_layout()
@@ -531,16 +638,19 @@ def _write_report(summary_df: pd.DataFrame, out_path: Path) -> None:
     lines: list[str] = []
     lines.append("# Phase-3 Failure Report")
     lines.append("")
-    lines.append("| dataset | topology_id | regime | method | failure_type | selection_rule | num_failed_edges | normal_mlu | mean_mlu_reachable | post_failure_peak_mlu | degradation_ratio | mean_disturbance | unreachable_od_ratio | dropped_demand_pct | feasible | recovery_steps |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| dataset | topology_id | display_name | source | tm_source | regime | method | failure_type | selection_rule | num_failed_edges | normal_mlu | mean_mlu_reachable | post_failure_peak_mlu | degradation_ratio | mean_disturbance | unreachable_od_ratio | dropped_demand_pct | feasible | recovery_steps |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
 
-    for _, row in summary_df.sort_values(["dataset", "regime", "failure_type", "method"]).iterrows():
+    for _, row in summary_df.sort_values(["display_name", "regime", "failure_type", "method"]).iterrows():
         lines.append(
             "| "
             + " | ".join(
                 [
                     str(row["dataset"]),
                     str(row.get("topology_id", "")),
+                    str(row.get("display_name", "")),
+                    str(row.get("source", "")),
+                    str(row.get("tm_source", "")),
                     str(row["regime"]),
                     str(row["method"]),
                     str(row["failure_type"]),
@@ -573,6 +683,7 @@ def main() -> None:
     mgm_cfg = cfg.get("mgm", {}) if isinstance(cfg.get("mgm"), dict) else {}
 
     methods = _parse_csv(args.methods)
+    selected_keys = set(_parse_csv(args.topology_keys))
     regime_names = _parse_csv(args.regimes)
     failure_types = _parse_csv(args.failure_types)
     selection_rules = _parse_csv(args.selection_rules)
@@ -594,6 +705,14 @@ def main() -> None:
     split_cfg = exp.get("split", {"train": 0.7, "val": 0.15, "test": 0.15})
 
     specs = load_topology_specs(cfg)
+    if selected_keys:
+        specs = [s for s in specs if s.key in selected_keys]
+    if not specs:
+        raise ValueError("No topology specs selected. Check --topology_keys and config entries.")
+
+    for spec in specs:
+        _validate_topology_file(spec, workspace_root)
+
     output_dir = Path(args.output_dir)
     plots_dir = output_dir / "plots"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -602,17 +721,13 @@ def main() -> None:
     timeseries_rows: list[dict[str, object]] = []
 
     for spec in specs:
-        try:
-            processed_path = build_one_phase3_dataset(
-                spec=spec,
-                data_dir=data_dir,
-                workspace_root=workspace_root,
-                mgm_cfg=mgm_cfg,
-                force_rebuild=args.force_rebuild,
-            )
-        except Exception as exc:
-            print(f"[WARN] Skipping topology {spec.key}: {exc}")
-            continue
+        processed_path = build_one_phase3_dataset(
+            spec=spec,
+            data_dir=data_dir,
+            workspace_root=workspace_root,
+            mgm_cfg=mgm_cfg,
+            force_rebuild=args.force_rebuild,
+        )
 
         for regime_name in regime_names:
             if regime_name not in regimes_cfg:
@@ -637,8 +752,16 @@ def main() -> None:
 
             topology_id = spec.topology_id or str(dataset.metadata.get("topology_id") or spec.key)
             display_name = spec.display_name or str(dataset.metadata.get("display_name") or spec.key)
+            tm_source = spec.tm_source
             num_nodes = int(dataset.metadata.get("num_nodes", len(dataset.nodes)))
             num_edges = int(dataset.metadata.get("num_edges", len(dataset.edges)))
+
+            k_settings = resolve_k_crit_settings(
+                exp_cfg=exp,
+                spec=spec,
+                num_edges=num_edges,
+                num_ods=len(dataset.od_pairs),
+            )
 
             scale_factor, probe = compute_auto_scale_factor(
                 tm=dataset.tm,
@@ -683,6 +806,9 @@ def main() -> None:
                             lp_time_limit_sec=lp_time_limit_sec,
                             full_mcf_time_limit_sec=full_mcf_time_limit_sec,
                             capacity_fn=capacity_fn,
+                            k_crit_settings=k_settings,
+                            failure_start_timestep=failure_start,
+                            k_paths=k_paths,
                         )
 
                         ts_df = pd.DataFrame(run_timeseries_rows)
@@ -693,6 +819,7 @@ def main() -> None:
                         for _, row in ts_df.iterrows():
                             out = dict(row)
                             out["source"] = spec.source
+                            out["tm_source"] = tm_source
                             out["topology_id"] = topology_id
                             out["display_name"] = display_name
                             out["num_nodes"] = num_nodes
@@ -705,11 +832,14 @@ def main() -> None:
                             out["degradation_factor"] = float(factor)
                             out["failure_start_timestep"] = int(failure_start)
                             out["scale_factor"] = float(scale_factor)
+                            out["k_crit_mode"] = k_settings.mode
+                            out["k_crit_initial"] = int(k_settings.initial)
                             timeseries_rows.append(out)
 
                         for _, row in summary_df.iterrows():
                             out = dict(row)
                             out["source"] = spec.source
+                            out["tm_source"] = tm_source
                             out["topology_id"] = topology_id
                             out["display_name"] = display_name
                             out["num_nodes"] = num_nodes
@@ -724,6 +854,8 @@ def main() -> None:
                             out["target_mlu_train"] = target_mlu
                             out["scale_factor"] = float(scale_factor)
                             out["baseline_probe_mean_mlu"] = float(probe.mean_mlu)
+                            out["k_crit_mode"] = k_settings.mode
+                            out["k_crit_initial"] = int(k_settings.initial)
                             summary_rows.append(out)
 
     summary_df = pd.DataFrame(summary_rows)
@@ -734,6 +866,7 @@ def main() -> None:
         "topology_id",
         "display_name",
         "source",
+        "tm_source",
         "num_nodes",
         "num_edges",
         "method",
@@ -753,6 +886,7 @@ def main() -> None:
         "recovery_steps",
         "mean_runtime_sec",
         "mean_stretch",
+        "k_crit_used",
     ]
     keep_optional = [
         c
@@ -764,6 +898,10 @@ def main() -> None:
             "scale_factor",
             "baseline_probe_mean_mlu",
             "num_test_steps",
+            "k_crit_used_min",
+            "k_crit_used_max",
+            "k_crit_mode",
+            "k_crit_initial",
         ]
         if c in summary_df.columns
     ]
@@ -777,7 +915,7 @@ def main() -> None:
     if not ts_df.empty:
         ts_df = ts_df.sort_values(
             [
-                "dataset",
+                "display_name",
                 "regime",
                 "failure_type",
                 "selection_rule",
@@ -797,10 +935,8 @@ def main() -> None:
     ts_df.to_csv(recovery_ts_path, index=False)
     _build_recovery_view(ts_df).to_csv(recovery_view_path, index=False)
 
-    # Per-regime CSVs requested by professor.
     for regime in sorted(summary_df["regime"].dropna().unique()):
-        regime_df = summary_df[summary_df["regime"] == regime].copy()
-        regime_df.to_csv(output_dir / f"failures_{regime}.csv", index=False)
+        summary_df[summary_df["regime"] == regime].to_csv(output_dir / f"failures_{regime}.csv", index=False)
 
     _plot_failure_summary(summary_df, plots_dir)
     _write_report(summary_df, report_path)

@@ -21,12 +21,21 @@ class TopologySpec:
     key: str
     source: str
     topology_file: str
-    tm_mode: str  # real_tm | mgm
+    tm_source: str  # real | mgm
     dynamic_archive: str | None = None
     extracted_subdir: str | None = None
     max_steps: int | None = None
     topology_id: str | None = None
     display_name: str | None = None
+    expected_num_nodes: int | None = None
+    expected_num_edges: int | None = None
+    k_crit_mode: str | None = None
+    k_crit_fixed: int | None = None
+    k_crit_alpha_edges: float | None = None
+    k_crit_beta_ods: float | None = None
+    k_crit_min: int | None = None
+    k_crit_max: int | None = None
+    lp_runtime_budget_sec: float | None = None
 
 
 def build_od_pairs(nodes: Sequence[str]) -> list[ODPair]:
@@ -38,6 +47,53 @@ def _resolve_path(base_dir: Path, path_text: str) -> Path:
     if path.is_absolute():
         return path
     return base_dir / path
+
+
+def _validate_topology_size(spec: TopologySpec, topology: ParsedTopology, topology_path: Path) -> None:
+    num_nodes = len(topology.nodes)
+    num_edges = len(topology.edges)
+
+    if spec.expected_num_nodes is None and spec.expected_num_edges is None:
+        return
+
+    print(f"[Phase3] Parsed topology {spec.key}: nodes={num_nodes}, directed_links={num_edges}")
+
+    mismatches: list[str] = []
+    if spec.expected_num_nodes is not None and num_nodes != int(spec.expected_num_nodes):
+        mismatches.append(f"nodes expected={int(spec.expected_num_nodes)} actual={num_nodes}")
+    if spec.expected_num_edges is not None and num_edges != int(spec.expected_num_edges):
+        mismatches.append(f"directed_links expected={int(spec.expected_num_edges)} actual={num_edges}")
+
+    if not mismatches:
+        return
+
+    orientation_note = ""
+    if topology.source_graph_directed is not None and topology.source_edge_count is not None:
+        if topology.source_graph_directed:
+            orientation_note = f" Input graph appears directed with {int(topology.source_edge_count)} edges."
+        else:
+            orientation_note = (
+                f" Input graph appears undirected with {int(topology.source_edge_count)} edges; "
+                "parser converts each edge into two directed links."
+            )
+
+    details = "; ".join(mismatches)
+    raise RuntimeError(
+        f"Topology size check failed for '{spec.display_name or spec.key}' ({spec.key}) at {topology_path}: "
+        f"{details}.{orientation_note} Hint: You are using a reduced sample file; replace with benchmark topology file."
+    )
+
+
+def _processed_matches_current_topology(output_path: Path, topology: ParsedTopology) -> bool:
+    if not output_path.exists():
+        return False
+    try:
+        with np.load(output_path, allow_pickle=True) as payload:
+            stored_nodes = int(payload["nodes"].shape[0]) if "nodes" in payload else -1
+            stored_edges = int(payload["edge_src"].shape[0]) if "edge_src" in payload else -1
+        return stored_nodes == len(topology.nodes) and stored_edges == len(topology.edges)
+    except Exception:
+        return False
 
 
 def _load_real_tm_from_sndlib(
@@ -107,23 +163,26 @@ def build_one_phase3_dataset(
 ) -> Path:
     processed_dir = data_dir / "processed"
     output_path = processed_dir / f"{spec.key}.npz"
-    if output_path.exists() and not force_rebuild:
-        return output_path
 
     topology_path = _resolve_path(workspace_root, spec.topology_file)
     topology = parse_topology_from_source(spec.source, topology_path)
+    _validate_topology_size(spec, topology, topology_path)
+
+    if output_path.exists() and not force_rebuild and _processed_matches_current_topology(output_path, topology):
+        return output_path
+
     od_pairs = build_od_pairs(topology.nodes)
 
-    if spec.tm_mode == "real_tm":
+    if spec.tm_source == "real":
         if spec.source != "sndlib":
-            raise ValueError(f"real_tm mode currently supported only for SNDlib source, got {spec.source}")
+            raise ValueError(f"tm_source=real currently supported only for source=sndlib, got {spec.source}")
         tm, tm_meta = _load_real_tm_from_sndlib(
             data_dir=data_dir,
             dataset_key=spec.key,
             od_pairs=od_pairs,
             max_steps=spec.max_steps,
         )
-    elif spec.tm_mode == "mgm":
+    elif spec.tm_source == "mgm":
         steps = int(spec.max_steps if spec.max_steps is not None else mgm_cfg.get("steps", 500))
         tm = generate_mgm_tm(
             od_pairs=od_pairs,
@@ -142,7 +201,7 @@ def build_one_phase3_dataset(
             "seed": int(mgm_cfg.get("seed", 42)),
         }
     else:
-        raise ValueError(f"Unsupported tm_mode '{spec.tm_mode}'")
+        raise ValueError(f"Unsupported tm_source '{spec.tm_source}'")
 
     topology_id = spec.topology_id or spec.key
     display_name = spec.display_name or spec.key
@@ -151,10 +210,10 @@ def build_one_phase3_dataset(
         "phase": "phase3",
         "dataset_key": spec.key,
         "source": spec.source,
+        "tm_source": spec.tm_source,
         "topology_id": topology_id,
         "display_name": display_name,
         "topology_file": str(topology_path),
-        "tm_mode": spec.tm_mode,
         "normalization_rule": topology.normalization_rule,
         "num_nodes": len(topology.nodes),
         "num_edges": len(topology.edges),
@@ -165,6 +224,14 @@ def build_one_phase3_dataset(
 
     _save_processed_npz(output_path, topology, tm, od_pairs, metadata)
     return output_path
+
+
+def _get_tm_source(item: dict) -> str:
+    if "tm_source" in item and item["tm_source"] is not None:
+        return str(item["tm_source"]).strip().lower()
+    # backward compatibility with old configs.
+    tm_mode = str(item.get("tm_mode", "mgm")).strip().lower()
+    return "real" if tm_mode == "real_tm" else "mgm"
 
 
 def load_topology_specs(config: Dict[str, object]) -> list[TopologySpec]:
@@ -181,17 +248,47 @@ def load_topology_specs(config: Dict[str, object]) -> list[TopologySpec]:
         topology_file = str(item.get("topology_file", "")).strip()
         if not key or not source or not topology_file:
             continue
+
+        tm_source = _get_tm_source(item)
+        if tm_source not in {"real", "mgm"}:
+            raise ValueError(f"Invalid tm_source '{tm_source}' for topology '{key}'. Use real|mgm.")
+
+        expected_num_nodes = None
+        if item.get("expected_num_nodes") is not None:
+            expected_num_nodes = int(item["expected_num_nodes"])
+        elif item.get("expected_nodes") is not None:
+            expected_num_nodes = int(item["expected_nodes"])
+
+        expected_num_edges = None
+        if item.get("expected_num_edges") is not None:
+            expected_num_edges = int(item["expected_num_edges"])
+        elif item.get("expected_directed_edges") is not None:
+            expected_num_edges = int(item["expected_directed_edges"])
+
         specs.append(
             TopologySpec(
                 key=key,
                 source=source,
                 topology_file=topology_file,
-                tm_mode=str(item.get("tm_mode", "mgm")),
+                tm_source=tm_source,
                 dynamic_archive=item.get("dynamic_archive"),
                 extracted_subdir=item.get("extracted_subdir"),
                 max_steps=int(item["max_steps"]) if item.get("max_steps") is not None else None,
                 topology_id=str(item.get("topology_id")).strip() if item.get("topology_id") is not None else None,
                 display_name=str(item.get("display_name")).strip() if item.get("display_name") is not None else None,
+                expected_num_nodes=expected_num_nodes,
+                expected_num_edges=expected_num_edges,
+                k_crit_mode=str(item.get("k_crit_mode")).strip() if item.get("k_crit_mode") is not None else None,
+                k_crit_fixed=int(item["k_crit_fixed"]) if item.get("k_crit_fixed") is not None else None,
+                k_crit_alpha_edges=float(item["k_crit_alpha_edges"])
+                if item.get("k_crit_alpha_edges") is not None
+                else None,
+                k_crit_beta_ods=float(item["k_crit_beta_ods"]) if item.get("k_crit_beta_ods") is not None else None,
+                k_crit_min=int(item["k_crit_min"]) if item.get("k_crit_min") is not None else None,
+                k_crit_max=int(item["k_crit_max"]) if item.get("k_crit_max") is not None else None,
+                lp_runtime_budget_sec=float(item["lp_runtime_budget_sec"])
+                if item.get("lp_runtime_budget_sec") is not None
+                else None,
             )
         )
 

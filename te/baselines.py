@@ -123,6 +123,83 @@ def select_bottleneck_critical(
     return [od_idx for _, od_idx in scored[:k_crit]]
 
 
+def select_sensitivity_critical(
+    tm_vector: np.ndarray,
+    ecmp_policy: Sequence[np.ndarray],
+    path_library: PathLibrary,
+    capacities: np.ndarray,
+    k_crit: int,
+    util_power: float = 2.0,
+) -> List[int]:
+    """
+    Global sensitivity selector (B-lite).
+
+    1) Build baseline link utilization under ECMP.
+    2) Score each OD by demand * best candidate path congestion cost,
+       where path cost is sum(util^power) over edges on that path.
+    3) Pick top-Kcrit ODs by score.
+    """
+    if k_crit <= 0:
+        return []
+
+    num_edges = capacities.size
+    link_loads = np.zeros(num_edges, dtype=float)
+
+    for od_idx, demand in enumerate(tm_vector):
+        if demand <= 0:
+            continue
+        splits = np.asarray(ecmp_policy[od_idx], dtype=float)
+        paths = path_library.edge_idx_paths_by_od[od_idx]
+        if not paths or splits.size == 0:
+            continue
+
+        mass = float(np.sum(splits))
+        if mass <= EPS:
+            continue
+        splits = splits / mass
+
+        for path_idx, frac in enumerate(splits):
+            if frac <= 0:
+                continue
+            flow = float(demand) * float(frac)
+            for edge_idx in paths[path_idx]:
+                link_loads[int(edge_idx)] += flow
+
+    util = link_loads / np.maximum(capacities, EPS)
+    util_cost = np.power(np.maximum(util, 0.0), float(max(util_power, 1.0)))
+
+    scored: list[tuple[float, int]] = []
+    for od_idx, demand in enumerate(tm_vector):
+        if demand <= 0:
+            continue
+        paths = path_library.edge_idx_paths_by_od[od_idx]
+        if not paths:
+            continue
+
+        best_path_cost = float("inf")
+        for path_edges in paths:
+            cost = 0.0
+            for edge_idx in path_edges:
+                cost += float(util_cost[int(edge_idx)])
+            if cost < best_path_cost:
+                best_path_cost = cost
+
+        if not np.isfinite(best_path_cost):
+            continue
+        score = float(demand) * best_path_cost
+        scored.append((score, od_idx))
+
+    if not scored:
+        return []
+
+    max_score = max(score for score, _ in scored)
+    if max_score <= EPS:
+        return select_topk_by_demand(tm_vector, k_crit=k_crit)
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [od_idx for _, od_idx in scored[:k_crit]]
+
+
 def project_edge_flows_to_k_path_splits(
     edge_flows_by_od: Sequence[dict],
     path_library: PathLibrary,
