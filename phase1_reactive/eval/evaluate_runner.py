@@ -11,6 +11,7 @@ import pandas as pd
 from phase1_reactive.eval.benchmark import evaluate_one_dataset
 from phase1_reactive.eval.common import (
     DQN_PRETRAIN_METHOD,
+    MOE_METHOD,
     PPO_PRETRAIN_METHOD,
     build_reactive_env_cfg,
     checkpoint_map_from_train_dir,
@@ -117,8 +118,15 @@ def main() -> None:
         pre = ab_summary.copy()
         pre["variant"] = pre["method"].map({PPO_PRETRAIN_METHOD: "PPO + pretraining", DQN_PRETRAIN_METHOD: "DQN + pretraining"})
         frames.append(pre[["dataset", "display_name", "variant", "mean_mlu", "p95_mlu", "mean_delay", "mean_disturbance"]])
-        final = summary_all[summary_all["method"].isin(["our_drl_ppo", "our_drl_dqn", "our_drl_dual_gate"])].copy()
-        final["variant"] = final["method"].map({"our_drl_ppo": "PPO + pretraining + curriculum", "our_drl_dqn": "DQN + pretraining + curriculum", "our_drl_dual_gate": "Dual-Gate final"})
+        final = summary_all[summary_all["method"].isin(["our_drl_ppo", "our_drl_dqn", "our_drl_dual_gate", MOE_METHOD])].copy()
+        final["variant"] = final["method"].map(
+            {
+                "our_drl_ppo": "PPO + pretraining + curriculum",
+                "our_drl_dqn": "DQN + pretraining + curriculum",
+                "our_drl_dual_gate": "Dual-Gate final",
+                MOE_METHOD: "Hybrid MoE final",
+            }
+        )
         frames.append(final[["dataset", "display_name", "variant", "mean_mlu", "p95_mlu", "mean_delay", "mean_disturbance"]])
         pd.concat(frames, ignore_index=True, sort=False).to_csv(out_dir / "drl_improvement_comparison.csv", index=False)
 

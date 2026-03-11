@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Sequence
 
 import numpy as np
@@ -14,10 +15,13 @@ import torch
 
 from phase1_reactive.baselines.literature_baselines import method_note, select_literature_baseline
 from phase1_reactive.drl.dqn_selector import load_trained_dqn
+from phase1_reactive.drl.moe_gate import load_trained_moe_gate
+from phase1_reactive.drl.moe_inference import choose_moe_gate
 from phase1_reactive.drl.state_builder import build_reactive_observation, compute_reactive_telemetry
 from phase1_reactive.eval.common import (
     DQN_METHOD,
     DUAL_GATE_METHOD,
+    MOE_METHOD,
     PPO_METHOD,
     build_reactive_env_cfg,
     checkpoint_map_from_train_dir,
@@ -135,20 +139,21 @@ def _select_dqn_topk(q_scores: torch.Tensor, active_mask: torch.Tensor, k_crit: 
     return active.index_select(0, top).detach().cpu().numpy().astype(int).tolist()
 
 
-def _evaluate_candidate(tm_vector, selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec):
+def _evaluate_candidate(tm_vector, selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec, telemetry_cfg):
     lp = solve_selected_path_lp(tm_vector, selected, ecmp_base, current_paths, current_caps, time_limit_sec=lp_time_limit_sec)
     routing = apply_routing(tm_vector, lp.splits, current_paths, current_caps)
-    telemetry = compute_reactive_telemetry(tm_vector, lp.splits, current_paths, routing, current_weights, prev_latency_by_od=prev_latency_by_od)
+    telemetry = compute_reactive_telemetry(tm_vector, lp.splits, current_paths, routing, current_weights, prev_latency_by_od=prev_latency_by_od, cfg=telemetry_cfg)
     disturbance = compute_disturbance(prev_splits, lp.splits, tm_vector)
     return lp, routing, telemetry, float(disturbance)
 
 
-def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: str, failure_start: int, k_paths: int, k_crit: int, lp_time_limit_sec: int, checkpoint_paths: dict[str, Path]) -> pd.DataFrame:
+def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: str, failure_start: int, k_paths: int, k_crit: int, lp_time_limit_sec: int, telemetry_cfg, checkpoint_paths: dict[str, Path]) -> pd.DataFrame:
     failed_edges = _pick_failure_edges(dataset, base_paths, failure_start, failure_type)
     post_failure = _build_failure_state(dataset, base_paths, failure_type, failed_edges, k_paths)
     method = PPO_METHOD if str(method) == "our_drl" else str(method)
-    ppo_model = load_trained_ppo(checkpoint_paths[PPO_METHOD], device="cpu") if method in {PPO_METHOD, DUAL_GATE_METHOD} else None
-    dqn_model = load_trained_dqn(checkpoint_paths[DQN_METHOD], device="cpu") if method in {DQN_METHOD, DUAL_GATE_METHOD} else None
+    ppo_model = load_trained_ppo(checkpoint_paths[PPO_METHOD], device="cpu") if method in {PPO_METHOD, DUAL_GATE_METHOD, MOE_METHOD} else None
+    dqn_model = load_trained_dqn(checkpoint_paths[DQN_METHOD], device="cpu") if method in {DQN_METHOD, DUAL_GATE_METHOD, MOE_METHOD} else None
+    moe_model = load_trained_moe_gate(checkpoint_paths[MOE_METHOD], device="cpu") if method == MOE_METHOD else None
     rows = []
     prev_splits = None
     prev_latency_by_od = None
@@ -173,6 +178,7 @@ def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: s
         decision_start = time.perf_counter()
         inference_latency = 0.0
         gate_choice = None
+        gate_info = {}
 
         if method == "ospf":
             final_splits = ospf_splits(current_paths)
@@ -184,10 +190,10 @@ def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: s
             selected = []
             status = "Static"
             lp_runtime = 0.0
-        elif method in {PPO_METHOD, DQN_METHOD, DUAL_GATE_METHOD}:
+        elif method in {PPO_METHOD, DQN_METHOD, DUAL_GATE_METHOD, MOE_METHOD}:
             state_splits = _state_splits_for_paths(prev_splits, current_paths)
             state_routing = apply_routing(tm_vector, state_splits, current_paths, current_caps)
-            state_telemetry = compute_reactive_telemetry(tm_vector, state_splits, current_paths, state_routing, current_weights, prev_latency_by_od=prev_latency_by_od)
+            state_telemetry = compute_reactive_telemetry(tm_vector, state_splits, current_paths, state_routing, current_weights, prev_latency_by_od=prev_latency_by_od, cfg=telemetry_cfg)
             obs = build_reactive_observation(
                 current_tm=tm_vector,
                 path_library=current_paths,
@@ -204,18 +210,18 @@ def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: s
                 if method == PPO_METHOD:
                     selected_t, _, _, _ = ppo_model.act(od_t, gf_t, mask_t, k_crit, deterministic=True)
                     selected = selected_t.detach().cpu().numpy().astype(int).tolist()
-                    lp, routing, telemetry, disturbance = _evaluate_candidate(tm_vector, selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec)
+                    lp, routing, telemetry, disturbance = _evaluate_candidate(tm_vector, selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec, telemetry_cfg)
                 elif method == DQN_METHOD:
                     q_scores = dqn_model.q_scores(od_t, gf_t)
                     selected = _select_dqn_topk(q_scores, mask_t, k_crit)
-                    lp, routing, telemetry, disturbance = _evaluate_candidate(tm_vector, selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec)
-                else:
+                    lp, routing, telemetry, disturbance = _evaluate_candidate(tm_vector, selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec, telemetry_cfg)
+                elif method == DUAL_GATE_METHOD:
                     ppo_selected_t, _, _, _ = ppo_model.act(od_t, gf_t, mask_t, k_crit, deterministic=True)
                     ppo_selected = ppo_selected_t.detach().cpu().numpy().astype(int).tolist()
                     q_scores = dqn_model.q_scores(od_t, gf_t)
                     dqn_selected = _select_dqn_topk(q_scores, mask_t, k_crit)
-                    ppo_lp, ppo_routing, ppo_telemetry, ppo_dist = _evaluate_candidate(tm_vector, ppo_selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec)
-                    dqn_lp, dqn_routing, dqn_telemetry, dqn_dist = _evaluate_candidate(tm_vector, dqn_selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec)
+                    ppo_lp, ppo_routing, ppo_telemetry, ppo_dist = _evaluate_candidate(tm_vector, ppo_selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec, telemetry_cfg)
+                    dqn_lp, dqn_routing, dqn_telemetry, dqn_dist = _evaluate_candidate(tm_vector, dqn_selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec, telemetry_cfg)
                     if dqn_routing.mlu + 1e-9 < ppo_routing.mlu:
                         selected, lp, routing, telemetry, disturbance, gate_choice = dqn_selected, dqn_lp, dqn_routing, dqn_telemetry, dqn_dist, "dqn"
                     elif abs(dqn_routing.mlu - ppo_routing.mlu) <= 1e-9 and dqn_dist + 1e-9 < ppo_dist:
@@ -224,6 +230,20 @@ def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: s
                         selected, lp, routing, telemetry, disturbance, gate_choice = dqn_selected, dqn_lp, dqn_routing, dqn_telemetry, dqn_dist, "dqn"
                     else:
                         selected, lp, routing, telemetry, disturbance, gate_choice = ppo_selected, ppo_lp, ppo_routing, ppo_telemetry, ppo_dist, "ppo"
+                else:
+                    gate_env = SimpleNamespace(
+                        current_obs=obs,
+                        k_crit=int(k_crit),
+                        dataset=dataset,
+                        path_library=current_paths,
+                        capacities=current_caps,
+                        ecmp_base=ecmp_base,
+                        current_splits=state_splits,
+                        current_telemetry=state_telemetry,
+                    )
+                    selected, gate_info = choose_moe_gate(gate_env, ppo_model, dqn_model, moe_model, device="cpu")
+                    gate_choice = str(gate_info.get("gate_choice", "unknown"))
+                    lp, routing, telemetry, disturbance = _evaluate_candidate(tm_vector, selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec, telemetry_cfg)
             inference_latency = time.perf_counter() - inf_start
             final_splits = lp.splits
             lp_runtime = 0.0
@@ -235,13 +255,13 @@ def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: s
             lp_runtime = time.perf_counter() - lp_start
             final_splits = lp.splits
             routing = apply_routing(tm_vector, final_splits, current_paths, current_caps)
-            telemetry = compute_reactive_telemetry(tm_vector, final_splits, current_paths, routing, current_weights, prev_latency_by_od=prev_latency_by_od)
+            telemetry = compute_reactive_telemetry(tm_vector, final_splits, current_paths, routing, current_weights, prev_latency_by_od=prev_latency_by_od, cfg=telemetry_cfg)
             disturbance = compute_disturbance(prev_splits, final_splits, tm_vector)
             status = str(lp.status)
 
         if method in {"ospf", "ecmp"}:
             routing = apply_routing(tm_vector, final_splits, current_paths, current_caps)
-            telemetry = compute_reactive_telemetry(tm_vector, final_splits, current_paths, routing, current_weights, prev_latency_by_od=prev_latency_by_od)
+            telemetry = compute_reactive_telemetry(tm_vector, final_splits, current_paths, routing, current_weights, prev_latency_by_od=prev_latency_by_od, cfg=telemetry_cfg)
             disturbance = compute_disturbance(prev_splits, final_splits, tm_vector)
 
         prev_splits = clone_splits(final_splits)
@@ -250,29 +270,29 @@ def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: s
         if selected:
             prev_selected[np.asarray(selected, dtype=int)] = 1.0
 
-        rows.append(
-            {
-                "dataset": dataset.key,
-                "display_name": str(dataset.metadata.get("phase1_display_name", dataset.name)),
-                "failure_type": failure_type,
-                "method": method,
-                "timestep": int(timestep),
-                "failure_active": int(failure_active),
-                "failed_edges": ",".join(str(x) for x in failed_edges),
-                "latency": float(telemetry.mean_latency),
-                "throughput": float(telemetry.throughput),
-                "jitter": float(telemetry.jitter),
-                "mlu": float(routing.mlu),
-                "disturbance": float(disturbance),
-                "dropped_demand_pct": float(telemetry.dropped_demand_pct),
-                "inference_latency_ms": float(inference_latency * 1000.0),
-                "decision_time_ms": float((time.perf_counter() - decision_start) * 1000.0),
-                "status": status,
-                "selected_count": int(len(selected)),
-                "gate_choice": gate_choice,
-                "baseline_note": method_note(method),
-            }
-        )
+        row = {
+            "dataset": dataset.key,
+            "display_name": str(dataset.metadata.get("phase1_display_name", dataset.name)),
+            "failure_type": failure_type,
+            "method": method,
+            "timestep": int(timestep),
+            "failure_active": int(failure_active),
+            "failed_edges": ",".join(str(x) for x in failed_edges),
+            "latency": float(telemetry.mean_latency),
+            "throughput": float(telemetry.throughput),
+            "jitter": float(telemetry.jitter),
+            "mlu": float(routing.mlu),
+            "disturbance": float(disturbance),
+            "dropped_demand_pct": float(telemetry.dropped_demand_pct),
+            "inference_latency_ms": float(inference_latency * 1000.0),
+            "decision_time_ms": float((time.perf_counter() - decision_start) * 1000.0),
+            "status": status,
+            "selected_count": int(len(selected)),
+            "gate_choice": gate_choice,
+            "baseline_note": method_note(method),
+        }
+        row.update(gate_info)
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -336,8 +356,15 @@ def main() -> None:
         for failure_type in failure_types:
             method_frames = []
             for method in methods:
-                if method in {PPO_METHOD, DQN_METHOD, DUAL_GATE_METHOD}:
-                    needed = [PPO_METHOD] if method == PPO_METHOD else ([DQN_METHOD] if method == DQN_METHOD else [PPO_METHOD, DQN_METHOD])
+                if method in {PPO_METHOD, DQN_METHOD, DUAL_GATE_METHOD, MOE_METHOD}:
+                    if method == PPO_METHOD:
+                        needed = [PPO_METHOD]
+                    elif method == DQN_METHOD:
+                        needed = [DQN_METHOD]
+                    elif method == DUAL_GATE_METHOD:
+                        needed = [PPO_METHOD, DQN_METHOD]
+                    else:
+                        needed = [PPO_METHOD, DQN_METHOD, MOE_METHOD]
                     for need in needed:
                         if need not in checkpoint_paths or not checkpoint_paths[need].exists():
                             raise FileNotFoundError(f"Missing Phase-1 DRL checkpoint for {need}: {checkpoint_paths.get(need)}")
@@ -351,6 +378,7 @@ def main() -> None:
                         k_paths=int(exp.get("k_paths", 3)),
                         k_crit=int(env_cfg.k_crit),
                         lp_time_limit_sec=int(env_cfg.lp_time_limit_sec),
+                        telemetry_cfg=env_cfg.telemetry,
                         checkpoint_paths=checkpoint_paths,
                     )
                 )

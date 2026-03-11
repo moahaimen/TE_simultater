@@ -42,6 +42,7 @@ experiment:
     - our_drl_ppo
     - our_drl_dqn
     - our_drl_dual_gate
+    - our_hybrid_moe_gate
     - lp_optimal
   failure_types:
     - single_link_failure
@@ -99,6 +100,15 @@ dqn:
   warmstart_epochs: 4
   warmstart_lr: 0.001
   device: cpu
+
+moe_gate:
+  hidden_dim: 96
+  lr: 0.001
+  max_epochs: 16
+  patience: 5
+  weight_decay: 0.00001
+  device: cpu
+  score_normalization: rank
 
 teacher:
   lp_teacher_steps_per_topology: 8

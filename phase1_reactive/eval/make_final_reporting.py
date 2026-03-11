@@ -43,9 +43,10 @@ METHOD_ORDER = [
     "our_drl_ppo",
     "our_drl_dqn",
     "our_drl_dual_gate",
+    "our_hybrid_moe_gate",
     "lp_optimal_upper_bound",
 ]
-DRL_METHODS = ["our_drl_ppo", "our_drl_dqn", "our_drl_dual_gate"]
+DRL_METHODS = ["our_drl_ppo", "our_drl_dqn", "our_drl_dual_gate", "our_hybrid_moe_gate"]
 HEURISTIC_METHODS = ["topk", "bottleneck", "sensitivity", "erodrl", "flexdate", "cfrrl", "flexentry"]
 STATIC_METHODS = ["ospf", "ecmp"]
 PALETTE = {
@@ -61,6 +62,7 @@ PALETTE = {
     "our_drl_ppo": "#1f77b4",
     "our_drl_dqn": "#17becf",
     "our_drl_dual_gate": "#d62728",
+    "our_hybrid_moe_gate": "#8c564b",
     "lp_optimal_upper_bound": "#9467bd",
 }
 
@@ -408,7 +410,7 @@ def plot_seen_cdfs(eval_ts: pd.DataFrame, eval_summary: pd.DataFrame) -> list[Pa
         for ax, (_, row) in zip(axes_flat, seen.iterrows()):
             ds = row["dataset"]
             best_heur = choose_best_heuristic(eval_summary, ds)
-            methods = ["ecmp", "ospf", "our_drl_ppo", "our_drl_dqn", "our_drl_dual_gate"]
+            methods = ["ecmp", "ospf", "our_drl_ppo", "our_drl_dqn", "our_drl_dual_gate", "our_hybrid_moe_gate"]
             if best_heur:
                 methods.insert(2, best_heur)
             if not eval_ts[(eval_ts["dataset"] == ds) & (eval_ts["method"] == "lp_optimal_upper_bound")].empty:
@@ -440,7 +442,7 @@ def plot_selected_flow_cdfs(eval_ts: pd.DataFrame) -> list[Path]:
     axes_flat = axes.flatten()
     handles = None
     labels = None
-    methods = ["topk", "bottleneck", "sensitivity", "our_drl_ppo", "our_drl_dqn", "our_drl_dual_gate"]
+    methods = ["topk", "bottleneck", "sensitivity", "our_drl_ppo", "our_drl_dqn", "our_drl_dual_gate", "our_hybrid_moe_gate"]
     for ax, (_, row) in zip(axes_flat, seen.iterrows()):
         sub = eval_ts[eval_ts["dataset"] == row["dataset"]]
         _plot_cdf(ax, sub, metric, methods)
@@ -470,7 +472,7 @@ def plot_failure_cdf(failure_ts: pd.DataFrame, failure_summary: pd.DataFrame) ->
             methods = ["ecmp", "ospf"]
             if best_heur:
                 methods.append(best_heur)
-            methods.append("our_drl_dual_gate")
+            methods.extend(["our_hybrid_moe_gate", "our_drl_dual_gate"])
             methods = list(dict.fromkeys(methods))
             sub = focus[(focus["dataset"] == ds) & (focus["failure_type"] == ft)]
             _plot_cdf(ax, sub, "mlu", methods)
@@ -496,7 +498,7 @@ def plot_drl_vs_heuristic_seen(eval_ts: pd.DataFrame, eval_summary: pd.DataFrame
     for ax, (_, row) in zip(axes_flat, seen.iterrows()):
         ds = row["dataset"]
         best_heur = choose_best_heuristic(eval_summary, ds)
-        methods = [m for m in ["ecmp", "ospf", best_heur, "our_drl_dual_gate"] if m]
+        methods = [m for m in ["ecmp", "ospf", best_heur, "our_hybrid_moe_gate", "our_drl_dual_gate"] if m]
         methods = list(dict.fromkeys(methods))
         sub = eval_ts[eval_ts["dataset"] == ds]
         _plot_cdf(ax, sub, "mlu", methods)
@@ -519,7 +521,7 @@ def plot_germany50_cdf(gen_ts: pd.DataFrame, gen_summary: pd.DataFrame) -> list[
     if sub.empty:
         return outputs
     best_heur = choose_best_heuristic(gen_summary, "germany50")
-    methods = [m for m in ["ecmp", "ospf", best_heur, "our_drl_dual_gate"] if m]
+    methods = [m for m in ["ecmp", "ospf", best_heur, "our_hybrid_moe_gate", "our_drl_dual_gate"] if m]
     methods = list(dict.fromkeys(methods))
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     _plot_cdf(axes[0], sub, "mlu", methods)
@@ -562,7 +564,7 @@ def plot_seen_timeseries(eval_ts: pd.DataFrame, eval_summary: pd.DataFrame) -> l
         for ax, (_, row) in zip(axes_flat, seen.iterrows()):
             ds = row["dataset"]
             best_heur = choose_best_heuristic(eval_summary, ds)
-            methods = [m for m in ["ecmp", "ospf", best_heur, "our_drl_ppo", "our_drl_dqn", "our_drl_dual_gate"] if m]
+            methods = [m for m in ["ecmp", "ospf", best_heur, "our_drl_ppo", "our_drl_dqn", "our_drl_dual_gate", "our_hybrid_moe_gate"] if m]
             methods = list(dict.fromkeys(methods))
             sub = eval_ts[eval_ts["dataset"] == ds]
             _plot_timeseries(ax, sub, metric, methods)
@@ -582,7 +584,7 @@ def plot_seen_timeseries(eval_ts: pd.DataFrame, eval_summary: pd.DataFrame) -> l
 def plot_selected_count_timeseries(eval_ts: pd.DataFrame) -> list[Path]:
     outputs: list[Path] = []
     seen = eval_ts[["dataset", "display_name"]].drop_duplicates().sort_values("display_name")
-    methods = ["topk", "bottleneck", "sensitivity", "our_drl_ppo", "our_drl_dqn", "our_drl_dual_gate"]
+    methods = ["topk", "bottleneck", "sensitivity", "our_drl_ppo", "our_drl_dqn", "our_drl_dual_gate", "our_hybrid_moe_gate"]
     for metric, stem, ylabel in [
         ("selected_count", "critical_flow_count_vs_tm_index", "Selected Critical Flow Count"),
         ("selected_flow_percentage", "selected_flow_percentage_vs_tm_index", "Selected Flow Percentage (%)"),

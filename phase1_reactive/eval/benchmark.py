@@ -10,8 +10,9 @@ import pandas as pd
 from phase1_reactive.drl.dqn_selector import rollout_reactive_dqn_policy
 from phase1_reactive.drl.drl_selector import rollout_reactive_policy
 from phase1_reactive.drl.dual_gate import rollout_dual_gate_policy
+from phase1_reactive.drl.moe_inference import rollout_moe_gate_policy
 from phase1_reactive.env.offline_env import ReactiveRoutingEnv
-from phase1_reactive.eval.common import DQN_METHOD, DQN_PRETRAIN_METHOD, DRL_ALIAS, DUAL_GATE_METHOD, PPO_METHOD, PPO_PRETRAIN_METHOD
+from phase1_reactive.eval.common import DQN_METHOD, DQN_PRETRAIN_METHOD, DRL_ALIAS, DUAL_GATE_METHOD, MOE_METHOD, PPO_METHOD, PPO_PRETRAIN_METHOD
 from phase1_reactive.eval.core import attach_optimality_reference, run_lp_optimal_method, run_selector_lp_method, run_static_method
 
 
@@ -63,7 +64,7 @@ def evaluate_one_dataset(
                     lp_time_limit_sec=int(env_cfg.lp_time_limit_sec),
                 )
             )
-        elif key in {PPO_METHOD, PPO_PRETRAIN_METHOD, DQN_METHOD, DQN_PRETRAIN_METHOD, DUAL_GATE_METHOD}:
+        elif key in {PPO_METHOD, PPO_PRETRAIN_METHOD, DQN_METHOD, DQN_PRETRAIN_METHOD, DUAL_GATE_METHOD, MOE_METHOD}:
             env = ReactiveRoutingEnv(dataset, dataset.tm, path_library, split_name=split_name, cfg=env_cfg, env_name=dataset.key)
             if key in {PPO_METHOD, PPO_PRETRAIN_METHOD}:
                 checkpoint_path = _checkpoint_for(checkpoint_paths, key)
@@ -75,12 +76,21 @@ def evaluate_one_dataset(
                 if checkpoint_path is None or not checkpoint_path.exists():
                     raise FileNotFoundError(f"Missing Phase-1 DRL checkpoint for {key}: {checkpoint_path}")
                 df = rollout_reactive_dqn_policy(env, checkpoint_path, deterministic=True, device="cpu")
-            else:
+            elif key == DUAL_GATE_METHOD:
                 ppo_ckpt = _checkpoint_for(checkpoint_paths, PPO_METHOD)
                 dqn_ckpt = _checkpoint_for(checkpoint_paths, DQN_METHOD)
                 if ppo_ckpt is None or dqn_ckpt is None or not ppo_ckpt.exists() or not dqn_ckpt.exists():
                     raise FileNotFoundError("Dual-gate evaluation requires both final PPO and final DQN checkpoints")
                 df = rollout_dual_gate_policy(env, ppo_ckpt, dqn_ckpt, device="cpu")
+            else:
+                ppo_ckpt = _checkpoint_for(checkpoint_paths, PPO_METHOD)
+                dqn_ckpt = _checkpoint_for(checkpoint_paths, DQN_METHOD)
+                moe_ckpt = _checkpoint_for(checkpoint_paths, MOE_METHOD)
+                if ppo_ckpt is None or dqn_ckpt is None or moe_ckpt is None:
+                    raise FileNotFoundError("Hybrid MoE evaluation requires PPO, DQN, and MoE gate checkpoints")
+                if not ppo_ckpt.exists() or not dqn_ckpt.exists() or not moe_ckpt.exists():
+                    raise FileNotFoundError("Hybrid MoE evaluation requires existing PPO, DQN, and MoE gate checkpoints")
+                df = rollout_moe_gate_policy(env, ppo_ckpt, dqn_ckpt, moe_ckpt, device="cpu")
             df["dataset"] = dataset.key
             df["display_name"] = str(dataset.metadata.get("phase1_display_name", dataset.name))
             df["source"] = str(dataset.metadata.get("phase1_source", dataset.metadata.get("source", "unknown")))

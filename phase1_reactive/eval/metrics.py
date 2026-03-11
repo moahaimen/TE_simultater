@@ -9,7 +9,7 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
-from phase1_reactive.eval.common import DQN_METHOD, DQN_PRETRAIN_METHOD, DUAL_GATE_METHOD, DRL_ALIAS, PPO_METHOD, PPO_PRETRAIN_METHOD
+from phase1_reactive.eval.common import DQN_METHOD, DQN_PRETRAIN_METHOD, DRL_ALIAS, DUAL_GATE_METHOD, MOE_METHOD, PPO_METHOD, PPO_PRETRAIN_METHOD
 
 
 def summarize_timeseries(
@@ -108,6 +108,24 @@ def load_training_meta(train_dir: Path | str) -> dict[str, dict[str, Any]]:
     dqn_pre_meta = _load_summary(base / "dqn_pretrained" / "train_summary.json", config_key="dqn_config")
     if dqn_pre_meta is not None:
         mapping[DQN_PRETRAIN_METHOD] = dict(dqn_pre_meta)
+
+    moe_meta = _load_summary(base / "moe_gate" / "train_summary.json", config_key="moe_config")
+    if moe_meta is not None and ppo_meta is not None and dqn_meta is not None:
+        mapping[MOE_METHOD] = {
+            "training_time_sec": float(ppo_meta.get("training_time_sec", 0.0) or 0.0)
+            + float(dqn_meta.get("training_time_sec", 0.0) or 0.0)
+            + float(moe_meta.get("training_time_sec", 0.0) or 0.0),
+            "convergence_epoch": max(
+                float(ppo_meta.get("convergence_epoch", 0.0) or 0.0),
+                float(dqn_meta.get("convergence_epoch", 0.0) or 0.0),
+                float(moe_meta.get("convergence_epoch", 0.0) or 0.0),
+            ),
+            "convergence_rate": max(
+                float(ppo_meta.get("convergence_rate", 0.0) or 0.0),
+                float(dqn_meta.get("convergence_rate", 0.0) or 0.0),
+                float(moe_meta.get("convergence_rate", 0.0) or 0.0),
+            ),
+        }
 
     if ppo_meta is not None and dqn_meta is not None:
         mapping[DUAL_GATE_METHOD] = {

@@ -9,6 +9,7 @@ from typing import Sequence
 from phase1_reactive.data.topology_loader import Phase1ConfigBundle, Phase1TopologySpec, get_topology_specs, load_phase1_config
 from phase1_reactive.data.traffic_loader import load_reactive_dataset
 from phase1_reactive.drl.dqn_selector import DQNConfig
+from phase1_reactive.drl.moe_gate import MoeGateConfig
 from phase1_reactive.drl.reward import ReactiveRewardConfig
 from phase1_reactive.env.offline_env import ReactiveEnvConfig
 from phase1_reactive.routing.path_cache import build_dataset_paths
@@ -22,6 +23,7 @@ DQN_METHOD = "our_drl_dqn"
 PPO_PRETRAIN_METHOD = "our_drl_ppo_pretrained"
 DQN_PRETRAIN_METHOD = "our_drl_dqn_pretrained"
 DUAL_GATE_METHOD = "our_drl_dual_gate"
+MOE_METHOD = "our_hybrid_moe_gate"
 
 
 def load_bundle(config_path: str | Path) -> Phase1ConfigBundle:
@@ -55,6 +57,11 @@ def build_ppo_cfg(bundle: Phase1ConfigBundle) -> PPOConfig:
 def build_dqn_cfg(bundle: Phase1ConfigBundle) -> DQNConfig:
     dqn = bundle.raw.get("dqn", {}) if isinstance(bundle.raw.get("dqn"), dict) else {}
     return DQNConfig(**dqn)
+
+
+def build_moe_cfg(bundle: Phase1ConfigBundle) -> MoeGateConfig:
+    moe = bundle.raw.get("moe_gate", {}) if isinstance(bundle.raw.get("moe_gate"), dict) else {}
+    return MoeGateConfig(**moe)
 
 
 def load_named_dataset(bundle: Phase1ConfigBundle, spec: Phase1TopologySpec, max_steps: int | None):
@@ -115,5 +122,9 @@ def checkpoint_map_from_train_dir(train_dir: Path | str) -> dict[str, Path]:
     dqn_pre = base / "dqn_pretrained" / "qnet.pt"
     if dqn_pre.exists():
         mapping[DQN_PRETRAIN_METHOD] = dqn_pre
+
+    moe_ckpt = base / "moe_gate" / "gate.pt"
+    if moe_ckpt.exists():
+        mapping[MOE_METHOD] = moe_ckpt
 
     return mapping
