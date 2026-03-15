@@ -31,6 +31,14 @@ def _build_table_a(gen: pd.DataFrame) -> pd.DataFrame:
         (best["ecmp_mean_mlu"] - best["mean_mlu"]) / best["ecmp_mean_mlu"] * 100.0
     )
 
+    if "mean_gap_pct" in best.columns:
+        best["mean_gap_pct_vs_opt"] = best["mean_gap_pct"]
+        best["mean_achieved_pct_vs_opt"] = best["mean_achieved_pct"]
+    if "opt_solved_steps" in best.columns and "opt_total_steps" in best.columns:
+        best["opt_solved_steps/opt_total_steps"] = best["opt_solved_steps"].fillna(0).astype(int).astype(str) + "/" + best[
+            "opt_total_steps"
+        ].fillna(0).astype(int).astype(str)
+
     cols = [
         "display_name",
         "source",
@@ -45,6 +53,12 @@ def _build_table_a(gen: pd.DataFrame) -> pd.DataFrame:
         "ecmp_p95_mlu",
         "gain_vs_ecmp_mean_pct",
     ]
+    if "mean_gap_pct_vs_opt" in best.columns:
+        cols.append("mean_gap_pct_vs_opt")
+    if "mean_achieved_pct_vs_opt" in best.columns:
+        cols.append("mean_achieved_pct_vs_opt")
+    if "opt_solved_steps/opt_total_steps" in best.columns:
+        cols.append("opt_solved_steps/opt_total_steps")
     if "k_crit_used" in best.columns:
         cols.append("k_crit_used")
 
@@ -109,7 +123,16 @@ def _write_docx(table_a: pd.DataFrame, table_b: pd.DataFrame, out_path: Path) ->
         "ECMP p95 MLU",
         "Gain vs ECMP (mean %)",
     ]
+    include_gap_a = "mean_gap_pct_vs_opt" in table_a.columns
+    include_ach_a = "mean_achieved_pct_vs_opt" in table_a.columns
+    include_opt_steps_a = "opt_solved_steps/opt_total_steps" in table_a.columns
     include_kcrit_a = "k_crit_used" in table_a.columns
+    if include_gap_a:
+        headers_a.append("Mean gap vs LP-opt (%)")
+    if include_ach_a:
+        headers_a.append("Mean achieved vs LP-opt (%)")
+    if include_opt_steps_a:
+        headers_a.append("LP-opt solved/total")
     if include_kcrit_a:
         headers_a.append("Kcrit used")
 
@@ -131,9 +154,20 @@ def _write_docx(table_a: pd.DataFrame, table_b: pd.DataFrame, out_path: Path) ->
         row[8].text = f"{r['p95_mlu']:.4f}"
         row[9].text = f"{r['ecmp_mean_mlu']:.4f}"
         row[10].text = f"{r['ecmp_p95_mlu']:.4f}"
-        row[11].text = f"{r['gain_vs_ecmp_mean_pct']:.2f}"
+        col = 11
+        row[col].text = f"{r['gain_vs_ecmp_mean_pct']:.2f}"
+        if include_gap_a:
+            col += 1
+            row[col].text = "nan" if pd.isna(r["mean_gap_pct_vs_opt"]) else f"{r['mean_gap_pct_vs_opt']:.2f}"
+        if include_ach_a:
+            col += 1
+            row[col].text = "nan" if pd.isna(r["mean_achieved_pct_vs_opt"]) else f"{r['mean_achieved_pct_vs_opt']:.2f}"
+        if include_opt_steps_a:
+            col += 1
+            row[col].text = str(r["opt_solved_steps/opt_total_steps"])
         if include_kcrit_a:
-            row[12].text = str(int(round(float(r["k_crit_used"]))))
+            col += 1
+            row[col].text = str(int(round(float(r["k_crit_used"]))))
 
     doc.add_paragraph("")
     doc.add_paragraph("Table B - Failure Scenarios (Reachable-only + Infeasibility)").runs[0].bold = True

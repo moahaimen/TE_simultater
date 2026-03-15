@@ -89,6 +89,17 @@ def write_report(
             "mean_disturbance",
             "p95_disturbance",
         ]
+        if "mean_gap_pct" in ordered.columns:
+            table_cols.extend(
+                [
+                    "mean_gap_pct",
+                    "p95_gap_pct",
+                    "mean_achieved_pct",
+                    "p95_achieved_pct",
+                    "opt_solved_steps",
+                    "opt_total_steps",
+                ]
+            )
         lines.append(_table_markdown(ordered, table_cols))
         lines.append("")
 

@@ -17,6 +17,7 @@ import pandas as pd
 import torch
 import yaml
 
+from eval.optimality import attach_optimality_columns, solve_optimal_reference_steps, summarize_optimality
 from eval.plots import generate_plots_for_dataset
 from phase2.predictors import (
     BaseTMPredictor,
@@ -134,6 +135,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale_probe_steps", type=int, default=None, help="Override auto-scale probe steps")
     parser.add_argument("--disable_auto_scale", action="store_true", help="Disable config scaling.auto_target")
     parser.add_argument("--regime", default=None, help="Optional regime label, e.g., C2 or C3")
+    parser.add_argument(
+        "--optimality_eval_steps",
+        type=int,
+        default=None,
+        help="LP-optimal sample steps on test split for gap metrics",
+    )
     return parser.parse_args()
 
 
@@ -514,23 +521,35 @@ def write_phase2_report(
         ordered = ds_summary.sort_values("mean_mlu", ascending=True)
         lines.append("### TE Metrics (test)")
         lines.append("")
-        lines.append("| method | mean_mlu | p95_mlu | mean_disturbance | p95_disturbance | mean_runtime_sec |")
-        lines.append("| --- | --- | --- | --- | --- | --- |")
+        base_cols = [
+            "method",
+            "mean_mlu",
+            "p95_mlu",
+            "mean_disturbance",
+            "p95_disturbance",
+            "mean_runtime_sec",
+        ]
+        opt_cols = [
+            "mean_gap_pct",
+            "p95_gap_pct",
+            "mean_achieved_pct",
+            "p95_achieved_pct",
+            "opt_solved_steps",
+            "opt_total_steps",
+        ]
+        cols = base_cols + (opt_cols if "mean_gap_pct" in ordered.columns else [])
+
+        lines.append("| " + " | ".join(cols) + " |")
+        lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
         for _, row in ordered.iterrows():
-            lines.append(
-                "| "
-                + " | ".join(
-                    [
-                        str(row["method"]),
-                        f"{row['mean_mlu']:.6f}",
-                        f"{row['p95_mlu']:.6f}",
-                        f"{row['mean_disturbance']:.6f}",
-                        f"{row['p95_disturbance']:.6f}",
-                        f"{row['mean_runtime_sec']:.6f}",
-                    ]
-                )
-                + " |"
-            )
+            values = []
+            for col in cols:
+                val = row[col]
+                if isinstance(val, float):
+                    values.append(f"{val:.6f}" if np.isfinite(val) else "nan")
+                else:
+                    values.append(str(val))
+            lines.append("| " + " | ".join(values) + " |")
         lines.append("")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -582,6 +601,11 @@ def main() -> None:
             args.full_mcf_time_limit_sec
             if args.full_mcf_time_limit_sec is not None
             else exp_cfg.get("full_mcf_time_limit_sec", 90)
+        )
+        optimality_eval_steps = int(
+            args.optimality_eval_steps
+            if args.optimality_eval_steps is not None
+            else exp_cfg.get("optimality_eval_steps", 30)
         )
 
         predictor_name = str(args.predictor if args.predictor is not None else phase2_cfg.get("predictor", "ar_ridge"))
@@ -703,7 +727,32 @@ def main() -> None:
             dataset_rows.append(method_df)
 
         dataset_ts = pd.concat(dataset_rows, ignore_index=True)
+
+        opt_count = max(0, min(int(optimality_eval_steps), len(rollout)))
+        opt_samples = [
+            {
+                "timestep": int(step.eval_t),
+                "test_step": int(step_idx),
+                "tm_vector": step.actual_tm,
+            }
+            for step_idx, step in enumerate(rollout[:opt_count])
+        ]
+        optimal_steps = solve_optimal_reference_steps(
+            od_pairs=dataset.od_pairs,
+            nodes=dataset.nodes,
+            edges=dataset.edges,
+            capacities=dataset.capacities,
+            samples=opt_samples,
+            time_limit_sec=full_mcf_time_limit_sec,
+        )
+
+        dataset_ts = attach_optimality_columns(dataset_ts, optimal_steps, time_col="eval_t")
+        dataset_ts["optimality_eval_steps"] = int(opt_count)
+
         dataset_summary = summarize_method(dataset_ts)
+        opt_summary = summarize_optimality(dataset_ts, group_cols=["dataset", "method"])
+        dataset_summary = dataset_summary.merge(opt_summary, on=["dataset", "method"], how="left")
+        dataset_summary["optimality_eval_steps"] = int(opt_count)
         dataset_summary["predictor"] = predictor_name
         dataset_summary["regime"] = args.regime if args.regime else ""
         dataset_summary["scale_factor"] = float(scale_factor)
@@ -799,6 +848,7 @@ def main() -> None:
         "blend_lambda": float(args.blend_lambda),
         "safe_z": float(args.safe_z),
         "regime": args.regime,
+        "optimality_eval_steps": int(args.optimality_eval_steps) if args.optimality_eval_steps is not None else None,
         "configs": config_payload,
     }
     (output_dir / "run_metadata.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")

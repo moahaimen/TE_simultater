@@ -16,6 +16,7 @@ import pandas as pd
 import yaml
 
 from phase3.dataset_builder import build_one_phase3_dataset, load_topology_specs
+from eval.optimality import attach_optimality_columns, solve_optimal_reference_steps, summarize_optimality
 from phase3.eval_utils import resolve_k_crit_settings, run_methods_on_dataset
 from te.scaling import apply_scale, compute_auto_scale_factor
 from te.simulator import build_paths, load_dataset
@@ -29,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topology_keys", default="")
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--force_rebuild", action="store_true")
+    parser.add_argument("--optimality_eval_steps", type=int, default=None, help="LP-optimal sample steps on test split")
     return parser.parse_args()
 
 
@@ -111,6 +113,10 @@ def _write_report(summary_df: pd.DataFrame, out_path: Path) -> None:
         "mean_disturbance",
         "p95_disturbance",
     ]
+    if "mean_gap_pct" in summary_df.columns:
+        cols.extend(["mean_gap_pct", "p95_gap_pct", "mean_achieved_pct", "p95_achieved_pct"])
+    if "opt_solved_steps" in summary_df.columns:
+        cols.extend(["opt_solved_steps", "opt_total_steps"])
     lines.append("| " + " | ".join(cols) + " |")
     lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
 
@@ -134,6 +140,24 @@ def _write_report(summary_df: pd.DataFrame, out_path: Path) -> None:
                     f"{row['mean_disturbance']:.6f}",
                     f"{row['p95_disturbance']:.6f}",
                 ]
+                + (
+                    [
+                        f"{row['mean_gap_pct']:.6f}" if pd.notna(row.get('mean_gap_pct')) else "nan",
+                        f"{row['p95_gap_pct']:.6f}" if pd.notna(row.get('p95_gap_pct')) else "nan",
+                        f"{row['mean_achieved_pct']:.6f}" if pd.notna(row.get('mean_achieved_pct')) else "nan",
+                        f"{row['p95_achieved_pct']:.6f}" if pd.notna(row.get('p95_achieved_pct')) else "nan",
+                    ]
+                    if "mean_gap_pct" in summary_df.columns
+                    else []
+                )
+                + (
+                    [
+                        str(int(row.get('opt_solved_steps', 0))),
+                        str(int(row.get('opt_total_steps', 0))),
+                    ]
+                    if "opt_solved_steps" in summary_df.columns
+                    else []
+                )
             )
             + " |"
         )
@@ -167,6 +191,9 @@ def main() -> None:
     lp_time_limit_sec = int(exp.get("lp_time_limit_sec", 20))
     full_mcf_time_limit_sec = int(exp.get("full_mcf_time_limit_sec", 90))
     scale_probe_steps = int(exp.get("scale_probe_steps", 200))
+    optimality_eval_steps = int(
+        args.optimality_eval_steps if args.optimality_eval_steps is not None else exp.get("optimality_eval_steps", 30)
+    )
     split_cfg = exp.get("split", {"train": 0.7, "val": 0.15, "test": 0.15})
 
     output_dir = Path(args.output_dir)
@@ -244,36 +271,51 @@ def main() -> None:
                 k_crit_settings=k_settings,
             )
 
-            for row in run.summary_rows:
-                row["source"] = spec.source
-                row["tm_source"] = tm_source
-                row["topology_id"] = topology_id
-                row["display_name"] = display_name
-                row["topology_file"] = spec.topology_file
-                row["num_nodes"] = num_nodes
-                row["num_edges"] = num_edges
-                row["regime"] = regime_name
-                row["target_mlu_train"] = float(target_mlu)
-                row["scale_factor"] = float(scale_factor)
-                row["baseline_probe_mean_mlu"] = float(probe.mean_mlu)
-                row["k_crit_mode"] = k_settings.mode
-                row["k_crit_initial"] = int(k_settings.initial)
-                summary_rows.append(row)
+            test_indices = list(range(dataset.split["test_start"], tm_scaled.shape[0]))
+            opt_count = max(0, min(int(optimality_eval_steps), len(test_indices)))
+            opt_samples = [
+                {
+                    "timestep": int(t_idx),
+                    "test_step": int(step_idx),
+                    "tm_vector": tm_scaled[t_idx],
+                }
+                for step_idx, t_idx in enumerate(test_indices[:opt_count])
+            ]
+            optimal_steps = solve_optimal_reference_steps(
+                od_pairs=dataset.od_pairs,
+                nodes=dataset.nodes,
+                edges=dataset.edges,
+                capacities=dataset.capacities,
+                samples=opt_samples,
+                time_limit_sec=full_mcf_time_limit_sec,
+            )
 
-            for row in run.timeseries_rows:
-                row["source"] = spec.source
-                row["tm_source"] = tm_source
-                row["topology_id"] = topology_id
-                row["display_name"] = display_name
-                row["topology_file"] = spec.topology_file
-                row["num_nodes"] = num_nodes
-                row["num_edges"] = num_edges
-                row["regime"] = regime_name
-                row["target_mlu_train"] = float(target_mlu)
-                row["scale_factor"] = float(scale_factor)
-                row["k_crit_mode"] = k_settings.mode
-                row["k_crit_initial"] = int(k_settings.initial)
-                timeseries_rows.append(row)
+            run_ts = pd.DataFrame(run.timeseries_rows)
+            run_ts = attach_optimality_columns(run_ts, optimal_steps, time_col="timestep")
+            run_summary = pd.DataFrame(run.summary_rows)
+            opt_summary = summarize_optimality(run_ts, group_cols=["dataset", "method"])
+            run_summary = run_summary.merge(opt_summary, on=["dataset", "method"], how="left")
+
+            for df in (run_summary, run_ts):
+                df["source"] = spec.source
+                df["tm_source"] = tm_source
+                df["topology_id"] = topology_id
+                df["display_name"] = display_name
+                df["topology_file"] = spec.topology_file
+                df["num_nodes"] = num_nodes
+                df["num_edges"] = num_edges
+                df["regime"] = regime_name
+                df["target_mlu_train"] = float(target_mlu)
+                df["scale_factor"] = float(scale_factor)
+                df["k_crit_mode"] = k_settings.mode
+                df["k_crit_initial"] = int(k_settings.initial)
+
+            run_summary["baseline_probe_mean_mlu"] = float(probe.mean_mlu)
+            run_summary["optimality_eval_steps"] = int(opt_count)
+            run_ts["optimality_eval_steps"] = int(opt_count)
+
+            summary_rows.extend(run_summary.to_dict(orient="records"))
+            timeseries_rows.extend(run_ts.to_dict(orient="records"))
 
     summary_df = pd.DataFrame(summary_rows)
     ts_df = pd.DataFrame(timeseries_rows)
@@ -298,6 +340,7 @@ def main() -> None:
         "topology_keys": [s.key for s in specs],
         "num_topologies_evaluated": int(summary_df["dataset"].nunique()) if not summary_df.empty else 0,
         "regimes": regimes,
+        "optimality_eval_steps": int(optimality_eval_steps),
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 

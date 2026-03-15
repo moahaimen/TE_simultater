@@ -15,6 +15,7 @@ import torch
 import yaml
 
 from eval.make_report import write_report
+from eval.optimality import attach_optimality_columns, solve_optimal_reference_steps, summarize_optimality
 from eval.plots import generate_plots_for_dataset
 from rl.policy import ODSelectorPolicy, build_od_features, deterministic_topk
 from te.baselines import (
@@ -50,6 +51,12 @@ def parse_args() -> argparse.Namespace:
         "--rl_checkpoint",
         default=None,
         help="Path to RL checkpoint for rl_lp method (single checkpoint)",
+    )
+    parser.add_argument(
+        "--optimality_eval_steps",
+        type=int,
+        default=None,
+        help="LP-optimal sample steps on test split for gap metrics",
     )
     return parser.parse_args()
 
@@ -281,10 +288,34 @@ def main() -> None:
             if args.full_mcf_time_limit_sec is not None
             else exp_cfg.get("full_mcf_time_limit_sec", 90)
         )
+        optimality_eval_steps = int(
+            args.optimality_eval_steps
+            if args.optimality_eval_steps is not None
+            else exp_cfg.get("optimality_eval_steps", 30)
+        )
 
         path_library = build_paths(dataset, k_paths=k_paths)
         ospf_base = ospf_splits(path_library)
         ecmp_base = ecmp_splits(path_library)
+
+        test_indices = list(range(dataset.split["test_start"], dataset.tm.shape[0]))
+        opt_count = max(0, min(int(optimality_eval_steps), len(test_indices)))
+        opt_samples = [
+            {
+                "timestep": int(t_idx),
+                "test_step": int(step_idx),
+                "tm_vector": dataset.tm[t_idx],
+            }
+            for step_idx, t_idx in enumerate(test_indices[:opt_count])
+        ]
+        optimal_steps = solve_optimal_reference_steps(
+            od_pairs=dataset.od_pairs,
+            nodes=dataset.nodes,
+            edges=dataset.edges,
+            capacities=dataset.capacities,
+            samples=opt_samples,
+            time_limit_sec=full_mcf_time_limit_sec,
+        )
 
         dataset_rows = []
         for method in methods:
@@ -304,7 +335,13 @@ def main() -> None:
             dataset_rows.append(method_df)
 
         dataset_ts = pd.concat(dataset_rows, ignore_index=True)
+        dataset_ts = attach_optimality_columns(dataset_ts, optimal_steps, time_col="timestep")
+        dataset_ts["optimality_eval_steps"] = int(opt_count)
+
         dataset_summary = summarize_method(dataset_ts)
+        opt_summary = summarize_optimality(dataset_ts, group_cols=["dataset", "method"])
+        dataset_summary = dataset_summary.merge(opt_summary, on=["dataset", "method"], how="left")
+        dataset_summary["optimality_eval_steps"] = int(opt_count)
 
         dataset_out = output_dir / dataset.key
         dataset_out.mkdir(parents=True, exist_ok=True)

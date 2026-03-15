@@ -67,13 +67,26 @@ def main() -> None:
             "p95_mlu",
             "mean_disturbance",
         ]
+        if "mean_gap_pct" in best.columns:
+            cols.append("mean_gap_pct")
+        if "mean_achieved_pct" in best.columns:
+            cols.append("mean_achieved_pct")
+        if "opt_solved_steps" in best.columns:
+            cols.append("opt_solved_steps")
+        if "opt_total_steps" in best.columns:
+            cols.append("opt_total_steps")
         report_lines.append("| " + " | ".join(cols) + " |")
         report_lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
         for _, row in best.iterrows():
+            opt_gap_txt = f" | {row['mean_gap_pct']:.6f}" if "mean_gap_pct" in best.columns else ""
+            opt_ach_txt = f" | {row['mean_achieved_pct']:.6f}" if "mean_achieved_pct" in best.columns else ""
+            opt_solved_txt = f" | {int(row['opt_solved_steps'])}" if "opt_solved_steps" in best.columns else ""
+            opt_total_txt = f" | {int(row['opt_total_steps'])}" if "opt_total_steps" in best.columns else ""
             report_lines.append(
                 f"| {row['dataset']} | {row.get('topology_id', '')} | {row.get('display_name', '')} | {row['source']} | {row.get('tm_source', '')} | "
                 f"{int(row.get('num_nodes', 0))} | {int(row.get('num_edges', 0))} | {row['regime']} | {row['method']} | "
-                f"{row['mean_mlu']:.6f} | {row['p95_mlu']:.6f} | {row['mean_disturbance']:.6f} |"
+                f"{row['mean_mlu']:.6f} | {row['p95_mlu']:.6f} | {row['mean_disturbance']:.6f}"
+                f"{opt_gap_txt}{opt_ach_txt}{opt_solved_txt}{opt_total_txt} |"
             )
         report_lines.append("")
 
