@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Sequence
 
@@ -13,6 +14,7 @@ from phase1_reactive.drl.moe_gate import MoeGateConfig
 from phase1_reactive.drl.reward import ReactiveRewardConfig
 from phase1_reactive.env.offline_env import ReactiveEnvConfig
 from phase1_reactive.routing.path_cache import build_dataset_paths
+from phase3.eval_utils import KCritSettings, resolve_k_crit_settings
 from phase3.ppo_agent import PPOConfig
 from phase3.state_builder import TelemetryConfig
 
@@ -24,6 +26,7 @@ PPO_PRETRAIN_METHOD = "our_drl_ppo_pretrained"
 DQN_PRETRAIN_METHOD = "our_drl_dqn_pretrained"
 DUAL_GATE_METHOD = "our_drl_dual_gate"
 MOE_METHOD = "our_hybrid_moe_gate"
+GNN_METHOD = "our_gnn_selector"
 
 
 def load_bundle(config_path: str | Path) -> Phase1ConfigBundle:
@@ -37,16 +40,54 @@ def max_steps_from_args(bundle: Phase1ConfigBundle, override: int | None) -> int
     return int(exp.get("max_steps")) if isinstance(exp, dict) and exp.get("max_steps") is not None else None
 
 
-def build_reactive_env_cfg(bundle: Phase1ConfigBundle) -> ReactiveEnvConfig:
+def build_reactive_env_cfg(bundle: Phase1ConfigBundle, *, k_crit_override: int | None = None) -> ReactiveEnvConfig:
     exp = bundle.raw.get("experiment", {}) if isinstance(bundle.raw.get("experiment"), dict) else {}
     reward_cfg = bundle.raw.get("reward", {}) if isinstance(bundle.raw.get("reward"), dict) else {}
     telemetry_cfg = bundle.raw.get("telemetry", {}) if isinstance(bundle.raw.get("telemetry"), dict) else {}
+    k_crit = int(k_crit_override) if k_crit_override is not None else int(exp.get("k_crit", 20))
     return ReactiveEnvConfig(
-        k_crit=int(exp.get("k_crit", 20)),
+        k_crit=k_crit,
         lp_time_limit_sec=int(exp.get("lp_time_limit_sec", 20)),
         telemetry=TelemetryConfig(**telemetry_cfg),
         reward=ReactiveRewardConfig(**reward_cfg),
     )
+
+
+def resolve_phase1_k_crit(bundle: Phase1ConfigBundle, dataset) -> int:
+    """Resolve adaptive k_crit for a specific topology/dataset."""
+    exp = bundle.raw.get("experiment", {}) if isinstance(bundle.raw.get("experiment"), dict) else {}
+    mode = str(exp.get("k_crit_mode", "fixed")).strip().lower()
+    if mode == "fixed":
+        return int(exp.get("k_crit", 40))
+    # Use Phase 3 resolver infrastructure
+    num_edges = len(dataset.edges) if hasattr(dataset, "edges") else 0
+    num_ods = len(dataset.od_pairs) if hasattr(dataset, "od_pairs") else 0
+
+    class _Spec:
+        pass
+
+    spec = _Spec()
+    # Set per-topology overrides to None so resolver falls back to experiment config
+    spec.key = getattr(dataset, "key", "unknown")
+    spec.k_crit_mode = None
+    spec.k_crit_fixed = None
+    spec.k_crit_alpha_edges = None
+    spec.k_crit_beta_ods = None
+    spec.k_crit_min = None
+    spec.k_crit_max = None
+    spec.lp_runtime_budget_sec = None
+    settings = resolve_k_crit_settings(exp_cfg=exp, spec=spec, num_edges=num_edges, num_ods=num_ods)
+    return int(settings.initial)
+
+
+def resolve_k_paths(bundle: Phase1ConfigBundle, dataset) -> int:
+    """Return K=k_paths_large for large topologies, else K=k_paths."""
+    exp = bundle.raw.get("experiment", {}) if isinstance(bundle.raw.get("experiment"), dict) else {}
+    k_default = int(exp.get("k_paths", 3))
+    k_large = int(exp.get("k_paths_large", k_default))
+    threshold = int(exp.get("k_paths_threshold", 9999))
+    num_nodes = len(dataset.nodes) if hasattr(dataset, "nodes") else 0
+    return k_large if num_nodes > threshold else k_default
 
 
 def build_ppo_cfg(bundle: Phase1ConfigBundle) -> PPOConfig:
@@ -66,7 +107,8 @@ def build_moe_cfg(bundle: Phase1ConfigBundle) -> MoeGateConfig:
 
 def load_named_dataset(bundle: Phase1ConfigBundle, spec: Phase1TopologySpec, max_steps: int | None):
     dataset = load_reactive_dataset(spec, bundle, max_steps=max_steps)
-    path_library = build_dataset_paths(dataset, k_paths=int(bundle.raw.get("experiment", {}).get("k_paths", 3)))
+    k_paths = resolve_k_paths(bundle, dataset)
+    path_library = build_dataset_paths(dataset, k_paths=k_paths)
     return dataset, path_library
 
 
@@ -126,5 +168,9 @@ def checkpoint_map_from_train_dir(train_dir: Path | str) -> dict[str, Path]:
     moe_ckpt = base / "moe_gate" / "gate.pt"
     if moe_ckpt.exists():
         mapping[MOE_METHOD] = moe_ckpt
+
+    gnn_ckpt = base / "gnn_selector" / "gnn_selector.pt"
+    if gnn_ckpt.exists():
+        mapping[GNN_METHOD] = gnn_ckpt
 
     return mapping

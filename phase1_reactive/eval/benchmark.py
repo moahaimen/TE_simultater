@@ -11,8 +11,9 @@ from phase1_reactive.drl.dqn_selector import rollout_reactive_dqn_policy
 from phase1_reactive.drl.drl_selector import rollout_reactive_policy
 from phase1_reactive.drl.dual_gate import rollout_dual_gate_policy
 from phase1_reactive.drl.moe_inference import rollout_moe_gate_policy
+from phase1_reactive.drl.gnn_inference import rollout_gnn_selector_policy
 from phase1_reactive.env.offline_env import ReactiveRoutingEnv
-from phase1_reactive.eval.common import DQN_METHOD, DQN_PRETRAIN_METHOD, DRL_ALIAS, DUAL_GATE_METHOD, MOE_METHOD, PPO_METHOD, PPO_PRETRAIN_METHOD
+from phase1_reactive.eval.common import DQN_METHOD, DQN_PRETRAIN_METHOD, DRL_ALIAS, DUAL_GATE_METHOD, GNN_METHOD, MOE_METHOD, PPO_METHOD, PPO_PRETRAIN_METHOD, build_reactive_env_cfg, resolve_phase1_k_crit
 from phase1_reactive.eval.core import attach_optimality_reference, run_lp_optimal_method, run_selector_lp_method, run_static_method
 
 
@@ -45,6 +46,8 @@ def evaluate_one_dataset(
     full_mcf_time_limit_sec: int,
     optimality_eval_steps: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    # k_crit is already resolved per-topology by the caller (adaptive or fixed)
+    effective_k_crit = int(env_cfg.k_crit)
     frames: list[pd.DataFrame] = []
     opt_ref = pd.DataFrame()
     for method in methods:
@@ -60,10 +63,23 @@ def evaluate_one_dataset(
                     path_library,
                     split_name=split_name,
                     method=key,
-                    k_crit=int(env_cfg.k_crit),
+                    k_crit=effective_k_crit,
                     lp_time_limit_sec=int(env_cfg.lp_time_limit_sec),
                 )
             )
+        elif key == GNN_METHOD:
+            env = ReactiveRoutingEnv(dataset, dataset.tm, path_library, split_name=split_name, cfg=env_cfg, env_name=dataset.key)
+            gnn_ckpt = _checkpoint_for(checkpoint_paths, GNN_METHOD)
+            if gnn_ckpt is None or not gnn_ckpt.exists():
+                raise FileNotFoundError(f"Missing GNN selector checkpoint: {gnn_ckpt}")
+            df = rollout_gnn_selector_policy(env, gnn_ckpt, device="cpu")
+            df["dataset"] = dataset.key
+            df["display_name"] = str(dataset.metadata.get("phase1_display_name", dataset.name))
+            df["source"] = str(dataset.metadata.get("phase1_source", dataset.metadata.get("source", "unknown")))
+            df["traffic_mode"] = str(dataset.metadata.get("phase1_traffic_mode", "unknown"))
+            df["method"] = key
+            df["baseline_note"] = None
+            frames.append(df)
         elif key in {PPO_METHOD, PPO_PRETRAIN_METHOD, DQN_METHOD, DQN_PRETRAIN_METHOD, DUAL_GATE_METHOD, MOE_METHOD}:
             env = ReactiveRoutingEnv(dataset, dataset.tm, path_library, split_name=split_name, cfg=env_cfg, env_name=dataset.key)
             if key in {PPO_METHOD, PPO_PRETRAIN_METHOD}:

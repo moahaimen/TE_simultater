@@ -16,13 +16,14 @@ import torch.nn.functional as F
 
 @dataclass
 class MoeGateConfig:
-    hidden_dim: int = 96
+    hidden_dim: int = 128
     lr: float = 1e-3
     max_epochs: int = 18
     patience: int = 5
     weight_decay: float = 1e-5
+    dropout: float = 0.15
     device: str = "cpu"
-    score_normalization: str = "rank"
+    score_normalization: str = "quantile"
 
 
 @dataclass
@@ -37,20 +38,37 @@ class MoeGateTrainingSummary:
 
 
 class MoeGateNet(nn.Module):
-    def __init__(self, input_dim: int, num_experts: int, hidden_dim: int = 96):
+    def __init__(self, input_dim: int, num_experts: int, hidden_dim: int = 128, dropout: float = 0.15):
         super().__init__()
         self.input_dim = int(input_dim)
         self.num_experts = int(num_experts)
-        self.net = nn.Sequential(
-            nn.Linear(self.input_dim, int(hidden_dim)),
-            nn.ReLU(),
-            nn.Linear(int(hidden_dim), int(hidden_dim)),
-            nn.ReLU(),
-            nn.Linear(int(hidden_dim), self.num_experts),
-        )
+        h = int(hidden_dim)
+        # Input projection
+        self.input_proj = nn.Linear(self.input_dim, h)
+        # Residual block 1
+        self.ln1 = nn.LayerNorm(h)
+        self.fc1 = nn.Linear(h, h)
+        self.drop1 = nn.Dropout(float(dropout))
+        # Residual block 2
+        self.ln2 = nn.LayerNorm(h)
+        self.fc2 = nn.Linear(h, h)
+        self.drop2 = nn.Dropout(float(dropout))
+        # Output head
+        self.output_head = nn.Linear(h, self.num_experts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        h = F.relu(self.input_proj(x))
+        # Residual block 1: LayerNorm -> Linear -> ReLU -> Dropout + Skip
+        residual = h
+        h = self.ln1(h)
+        h = self.drop1(F.relu(self.fc1(h)))
+        h = h + residual
+        # Residual block 2: LayerNorm -> Linear -> ReLU -> Dropout + Skip
+        residual = h
+        h = self.ln2(h)
+        h = self.drop2(F.relu(self.fc2(h)))
+        h = h + residual
+        return self.output_head(h)
 
     def weights(self, x: torch.Tensor) -> torch.Tensor:
         return torch.softmax(self.forward(x), dim=-1)
@@ -116,6 +134,7 @@ def train_moe_gate(
         input_dim=int(sample["gate_features"].shape[0]),
         num_experts=int(sample["oracle_weights"].shape[0]),
         hidden_dim=int(cfg.hidden_dim),
+        dropout=float(getattr(cfg, "dropout", 0.15)),
     )
     dev = torch.device(cfg.device)
     model.to(dev)
@@ -202,7 +221,8 @@ def load_trained_moe_gate(path: Path | str, device: str = "cpu") -> MoeGateNet:
     model = MoeGateNet(
         input_dim=int(payload["input_dim"]),
         num_experts=int(payload["num_experts"]),
-        hidden_dim=int(cfg.get("hidden_dim", 96)),
+        hidden_dim=int(cfg.get("hidden_dim", 128)),
+        dropout=float(cfg.get("dropout", 0.15)),
     )
     model.load_state_dict(payload["state_dict"])
     model.eval()

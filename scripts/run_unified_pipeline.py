@@ -192,12 +192,39 @@ def collect_training_data(bundle, datasets, gnn_model, moe_models):
                     np.asarray(dataset.weights, dtype=float),
                 )
 
+                # Build MoE v3 function for this timestep if models available
+                moe_fn = None
+                if moe_models is not None:
+                    env_cfg = build_reactive_env_cfg(bundle, k_crit_override=k_crit)
+                    from phase1_reactive.drl.state_builder import build_reactive_observation
+                    ppo_m, dqn_m, gate_m = moe_models
+                    def _make_moe_fn(tm_v, ds, pl, kc, ecmp_b, caps, tel_):
+                        def fn():
+                            from phase1_reactive.drl.moe_inference import choose_moe_gate
+                            from types import SimpleNamespace
+                            obs = build_reactive_observation(
+                                current_tm=tm_v, path_library=pl, telemetry=tel_,
+                                prev_selected_indicator=np.zeros(len(ds.od_pairs), dtype=float),
+                                prev_disturbance=0.0,
+                            )
+                            mock_env = SimpleNamespace(
+                                current_obs=obs, k_crit=kc, dataset=ds,
+                                path_library=pl, capacities=caps,
+                                ecmp_base=ecmp_b, current_splits=ecmp_b,
+                                current_telemetry=tel_,
+                            )
+                            selected, _ = choose_moe_gate(mock_env, ppo_m, dqn_m, gate_m, device=DEVICE)
+                            return selected
+                        return fn
+                    moe_fn = _make_moe_fn(tm_vector, dataset, path_library, k_crit, ecmp_base, capacities, telemetry)
+
                 sample = collect_expert_results_per_timestep(
                     dataset, path_library, tm_vector, ecmp_base, capacities, k_crit,
                     telemetry=telemetry,
                     gnn_model=gnn_model,
                     gnn_device=DEVICE,
                     lp_time_limit_sec=15,
+                    moe_fn=moe_fn,
                 )
                 sample_list.append(sample)
 

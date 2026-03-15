@@ -134,10 +134,13 @@ def collect_expert_results_per_timestep(
     gnn_model=None,
     gnn_device="cpu",
     lp_time_limit_sec=20,
+    moe_fn=None,
 ) -> MetaTrainingSample:
     """Run all experts on a single timestep and record per-expert MLU.
 
     Returns a MetaTrainingSample with features, per-expert MLU, and best expert.
+
+    moe_fn: optional callable() -> list[int] that returns MoE v3 selection.
     """
     from te.lp_solver import solve_selected_path_lp
     from te.baselines import (
@@ -173,16 +176,26 @@ def collect_expert_results_per_timestep(
 
     # GNN expert
     if gnn_model is not None:
-        from phase1_reactive.drl.gnn_selector import build_graph_tensors, build_od_features
-        graph_data = build_graph_tensors(dataset, telemetry=telemetry, device=gnn_device)
-        od_data = build_od_features(
-            dataset, tm_vector, path_library, telemetry=telemetry, device=gnn_device,
-        )
-        active_mask = (np.asarray(tm_vector, dtype=np.float64) > 1e-12).astype(np.float32)
-        selected_gnn, _ = gnn_model.select_critical_flows(
-            graph_data, od_data, active_mask=active_mask, k_crit_default=k_crit,
-        )
-        expert_selections["gnn"] = selected_gnn
+        try:
+            from phase1_reactive.drl.gnn_selector import build_graph_tensors, build_od_features
+            graph_data = build_graph_tensors(dataset, telemetry=telemetry, device=gnn_device)
+            od_data = build_od_features(
+                dataset, tm_vector, path_library, telemetry=telemetry, device=gnn_device,
+            )
+            active_mask = (np.asarray(tm_vector, dtype=np.float64) > 1e-12).astype(np.float32)
+            selected_gnn, _ = gnn_model.select_critical_flows(
+                graph_data, od_data, active_mask=active_mask, k_crit_default=k_crit,
+            )
+            expert_selections["gnn"] = selected_gnn
+        except Exception:
+            pass  # GNN may fail on modified topologies (failure scenarios)
+
+    # MoE v3 expert
+    if moe_fn is not None:
+        try:
+            expert_selections["moe_v3"] = moe_fn()
+        except Exception:
+            pass
 
     # Solve LP for each expert and record MLU
     expert_mlus = {}
