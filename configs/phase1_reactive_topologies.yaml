@@ -84,11 +84,13 @@ topologies:
     expected_num_nodes: 92
     expected_num_edges: 192
 
-  - key: cernet_real
+  - key: cernet
     dataset_key: cernet
-    display_name: "CERNET real traffic"
+    display_name: "CERNET (TopologyZoo)"
     source: topologyzoo
-    topology_file: data/raw/topology/cernet.graphml
+    topology_file: data/topologyzoo/Cernet.graphml
     processed_file: cernet.npz
-    traffic_mode: external_real
-    tm_file: data/raw/traffic/cernet_tm.npz
+    traffic_mode: generator_optional
+    generator_name: mgm
+    expected_num_nodes: 41
+    expected_num_edges: 116

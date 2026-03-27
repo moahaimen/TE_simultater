@@ -27,6 +27,8 @@ experiment:
     - ebone
     - sprintlink
     - tiscali
+    - vtlwavenet2011
+    - cernet
   generalization_topologies:
     - germany50_real
   methods:
@@ -54,6 +56,7 @@ experiment:
     - sprintlink
     - tiscali
     - vtlwavenet2011
+    - cernet
 
 traffic_generator:
   name: mgm

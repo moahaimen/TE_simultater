@@ -1,0 +1,386 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<graphml xmlns="http://graphml.graphstruct.de/graphml">
+  <key id="d0" for="edge" attr.name="LinkSpeedRaw" attr.type="double"/>
+  <graph id="VtlWavenet2011" edgedefault="undirected">
+    <node id="n000"/>
+    <node id="n001"/>
+    <node id="n002"/>
+    <node id="n003"/>
+    <node id="n004"/>
+    <node id="n005"/>
+    <node id="n006"/>
+    <node id="n007"/>
+    <node id="n008"/>
+    <node id="n009"/>
+    <node id="n010"/>
+    <node id="n011"/>
+    <node id="n012"/>
+    <node id="n013"/>
+    <node id="n014"/>
+    <node id="n015"/>
+    <node id="n016"/>
+    <node id="n017"/>
+    <node id="n018"/>
+    <node id="n019"/>
+    <node id="n020"/>
+    <node id="n021"/>
+    <node id="n022"/>
+    <node id="n023"/>
+    <node id="n024"/>
+    <node id="n025"/>
+    <node id="n026"/>
+    <node id="n027"/>
+    <node id="n028"/>
+    <node id="n029"/>
+    <node id="n030"/>
+    <node id="n031"/>
+    <node id="n032"/>
+    <node id="n033"/>
+    <node id="n034"/>
+    <node id="n035"/>
+    <node id="n036"/>
+    <node id="n037"/>
+    <node id="n038"/>
+    <node id="n039"/>
+    <node id="n040"/>
+    <node id="n041"/>
+    <node id="n042"/>
+    <node id="n043"/>
+    <node id="n044"/>
+    <node id="n045"/>
+    <node id="n046"/>
+    <node id="n047"/>
+    <node id="n048"/>
+    <node id="n049"/>
+    <node id="n050"/>
+    <node id="n051"/>
+    <node id="n052"/>
+    <node id="n053"/>
+    <node id="n054"/>
+    <node id="n055"/>
+    <node id="n056"/>
+    <node id="n057"/>
+    <node id="n058"/>
+    <node id="n059"/>
+    <node id="n060"/>
+    <node id="n061"/>
+    <node id="n062"/>
+    <node id="n063"/>
+    <node id="n064"/>
+    <node id="n065"/>
+    <node id="n066"/>
+    <node id="n067"/>
+    <node id="n068"/>
+    <node id="n069"/>
+    <node id="n070"/>
+    <node id="n071"/>
+    <node id="n072"/>
+    <node id="n073"/>
+    <node id="n074"/>
+    <node id="n075"/>
+    <node id="n076"/>
+    <node id="n077"/>
+    <node id="n078"/>
+    <node id="n079"/>
+    <node id="n080"/>
+    <node id="n081"/>
+    <node id="n082"/>
+    <node id="n083"/>
+    <node id="n084"/>
+    <node id="n085"/>
+    <node id="n086"/>
+    <node id="n087"/>
+    <node id="n088"/>
+    <node id="n089"/>
+    <node id="n090"/>
+    <node id="n091"/>
+    <edge source="n000" target="n001">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n000" target="n091">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n001" target="n002">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n002" target="n003">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n003" target="n004">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n003" target="n035">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n004" target="n005">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n005" target="n006">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n006" target="n007">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n007" target="n008">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n008" target="n009">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n009" target="n010">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n010" target="n011">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n011" target="n012">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n012" target="n013">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n013" target="n014">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n013" target="n017">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n014" target="n015">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n014" target="n081">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n015" target="n016">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n016" target="n017">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n017" target="n018">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n018" target="n019">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n019" target="n020">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n020" target="n021">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n021" target="n022">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n022" target="n023">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n023" target="n024">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n024" target="n025">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n025" target="n026">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n026" target="n027">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n027" target="n028">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n028" target="n029">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n028" target="n031">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n029" target="n030">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n030" target="n031">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n031" target="n032">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n032" target="n033">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n033" target="n034">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n034" target="n035">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n035" target="n036">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n036" target="n037">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n037" target="n038">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n038" target="n039">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n039" target="n040">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n040" target="n041">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n041" target="n042">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n042" target="n043">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n043" target="n044">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n044" target="n045">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n045" target="n046">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n046" target="n047">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n047" target="n048">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n048" target="n049">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n049" target="n050">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n050" target="n051">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n051" target="n052">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n052" target="n053">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n053" target="n054">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n054" target="n055">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n055" target="n056">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n056" target="n057">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n057" target="n058">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n058" target="n059">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n059" target="n060">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n060" target="n061">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n061" target="n062">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n062" target="n063">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n063" target="n064">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n064" target="n065">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n065" target="n066">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n066" target="n067">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n067" target="n068">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n068" target="n069">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n069" target="n070">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n070" target="n071">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n071" target="n072">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n072" target="n073">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n073" target="n074">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n074" target="n075">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n075" target="n076">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n076" target="n077">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n077" target="n078">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n078" target="n079">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n079" target="n080">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n080" target="n081">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n081" target="n082">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n082" target="n083">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n083" target="n084">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n084" target="n085">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n085" target="n086">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n086" target="n087">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n087" target="n088">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n088" target="n089">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n089" target="n090">
+      <data key="d0">10.0</data>
+    </edge>
+    <edge source="n090" target="n091">
+      <data key="d0">10.0</data>
+    </edge>
+  </graph>
+</graphml>

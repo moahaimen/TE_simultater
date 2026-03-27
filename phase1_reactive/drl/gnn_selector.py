@@ -493,7 +493,7 @@ class GNNFlowSelector(nn.Module):
         with torch.no_grad():
             scores, k_pred, info = self.forward(graph_data, od_data)
 
-        k = k_pred if k_pred is not None else k_crit_default
+        k = min(k_pred, k_crit_default) if k_pred is not None else k_crit_default
         scores_np = scores.detach().cpu().numpy().astype(np.float32)
         active = np.asarray(active_mask, dtype=bool)
         active_indices = np.where(active)[0]
