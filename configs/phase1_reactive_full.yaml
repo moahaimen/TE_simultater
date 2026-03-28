@@ -17,18 +17,20 @@ experiment:
   train_topologies:
     - abilene_backbone
     - geant_core
+    - cernet_real
     - ebone
     - sprintlink
     - tiscali
-    - vtlwavenet2011
   eval_topologies:
     - abilene_backbone
     - geant_core
+    - cernet_real
     - ebone
     - sprintlink
     - tiscali
   generalization_topologies:
     - germany50_real
+    - vtlwavenet2011
   methods:
     - ospf
     - ecmp

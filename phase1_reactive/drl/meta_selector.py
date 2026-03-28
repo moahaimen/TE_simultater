@@ -395,6 +395,47 @@ def rollout_unified_selector(
     return pd.DataFrame(rows)
 
 
+def rollout_forced_expert_selector(
+    env, expert_fns: dict[str, Callable], forced_expert: str,
+    *, lp_time_limit_sec: int = 20,
+) -> pd.DataFrame:
+    """Rollout using a single forced expert through the unified pipeline.
+
+    Bypasses the meta-gate; always uses the specified expert.
+    Same pipeline code path, LP solver, ECMP base, k=40 as the learned gate.
+    """
+    if forced_expert not in expert_fns:
+        raise ValueError(
+            f"Expert '{forced_expert}' not available. "
+            f"Available: {list(expert_fns.keys())}"
+        )
+    expert_fn = expert_fns[forced_expert]
+    env.reset()
+    rows = []
+    done = False
+
+    while not done:
+        obs = env.current_obs
+        # Same feature extraction as learned gate (for timing parity)
+        features = build_meta_features(env.dataset, obs.current_tm, obs.telemetry)
+
+        t0 = time.perf_counter()
+        selected = expert_fn(env)
+        expert_time = (time.perf_counter() - t0) * 1000.0
+
+        _, reward, done, info = env.step(selected)
+        info = dict(info)
+        info["reward"] = float(reward)
+        info["method"] = f"unified_forced_{forced_expert}"
+        info["expert_chosen"] = forced_expert
+        info["decision_time_ms"] = float(
+            expert_time + info.get("decision_time_ms", 0.0)
+        )
+        rows.append(info)
+
+    return pd.DataFrame(rows)
+
+
 def rollout_oracle_selector(
     env, expert_fns: dict[str, Callable], expert_names: list[str],
     *, lp_time_limit_sec: int = 20,
