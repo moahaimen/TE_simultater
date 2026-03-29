@@ -129,7 +129,8 @@ bold_run(p, "Key results: ")
 p.add_run(
     "Germany50 (unseen): GNN selected 64% of timesteps, oracle gap +0.33%, accuracy 65.9%. "
     "Overall accuracy 60.3% across 8 topologies. Three topologies achieve +0.00% oracle gap "
-    "(Abilene, GEANT, Ebone). Mean decision time 48.4 ms."
+    "(Abilene, GEANT, Ebone). Mean selector decision overhead 48.4 ms; mean end-to-end time "
+    "(including LP) 118.8 ms."
 )
 
 # ============================================================
@@ -193,11 +194,11 @@ doc.add_paragraph(
 
 doc.add_heading("2.3 Feature Vector (49 dimensions)", level=2)
 features = [
-    ("TM statistics (8)", "mean, std, max, min, skew, kurtosis, sparsity, entropy of the traffic matrix"),
-    ("Per-expert demand stats (16)", "4 experts x {mean, std, max, sum} of selected OD demands"),
-    ("Cross-expert overlaps (11)", "pairwise Jaccard overlaps between all 6 expert pairs + 5 expert-vs-ECMP overlaps"),
+    ("TM statistics (8)", "mean, std, max, min_nonzero, skew, kurtosis, entropy, top-10 demand share"),
+    ("Per-expert demand stats (16)", "4 experts x {mean_demand, std_demand, max_demand, coverage} of selected OD pairs"),
+    ("Cross-expert agreement (11)", "6 pairwise Jaccard overlaps (BN-TopK, BN-Sens, BN-GNN, TopK-Sens, TopK-GNN, Sens-GNN) + 4 unique-to-expert fractions + 1 all-four-agree fraction"),
     ("Topology metrics (3)", "num_nodes, num_edges, edge_density"),
-    ("GNN diagnostics (5)", "GNN confidence, selection entropy, demand concentration, coverage, edge utilization variance"),
+    ("GNN diagnostics (5)", "alpha (mixing weight), confidence, GNN correction mean, w_bottleneck, w_sensitivity"),
     ("Demand shares (4)", "fraction of total demand captured by each expert's selection"),
     ("ECMP baseline (2)", "ECMP max link utilization, ECMP mean link utilization"),
 ]
@@ -481,16 +482,22 @@ add_table(
     col_widths=[0.9, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.7],
 )
 doc.add_paragraph(
-    "The MLP gate decision (feature extraction + MLP forward pass) takes < 2 ms on all topologies. "
-    "LP optimization dominates total time. The 4 expert runs add overhead (all must run before "
-    "the gate can decide), but this is inherent to the 'run all, pick best' architecture."
+    "Terminology: Decision time = all selector overhead before LP (running 4 experts + "
+    "feature extraction + MLP forward pass). LP time = LP solver only. "
+    "Total time = decision time + LP time (full end-to-end per timestep)."
+)
+doc.add_paragraph(
+    "The MLP gate inference itself (feature extraction + MLP forward pass) takes < 2 ms on all "
+    "topologies. The decision time is dominated by running all 4 experts (required before the gate "
+    "can decide). LP optimization adds roughly equal time. Both components are inherent to the "
+    "'run all experts, pick best, solve LP' architecture."
 )
 p = doc.add_paragraph()
-bold_run(p, "Mean decision time: ")
+bold_run(p, "Mean decision time (selector overhead before LP): ")
 p.add_run("48.4 ms. ")
-bold_run(p, "Mean LP time: ")
+bold_run(p, "Mean LP time (solver only): ")
 p.add_run("51.5 ms. ")
-bold_run(p, "Mean total time: ")
+bold_run(p, "Mean total time (end-to-end): ")
 p.add_run("118.8 ms.")
 
 # ============================================================
