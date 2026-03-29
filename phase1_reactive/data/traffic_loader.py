@@ -87,10 +87,11 @@ def load_reactive_dataset(
     allow_synth = {str(x).strip() for x in exp.get("allow_synthetic_topologies", []) if str(x).strip()}
     split = exp.get("split", {}) if isinstance(exp.get("split"), dict) else {}
 
-    if not spec.topology_file.exists():
-        raise FileNotFoundError(f"Missing topology file for {spec.display_name}: {spec.topology_file}")
-
     processed_path = _processed_path(spec)
+
+    # Allow loading from processed .npz even if source .graphml is missing
+    if not spec.topology_file.exists() and not processed_path.exists():
+        raise FileNotFoundError(f"Missing topology file for {spec.display_name}: {spec.topology_file}")
     mode = spec.traffic_mode
 
     if mode == "real_sndlib":

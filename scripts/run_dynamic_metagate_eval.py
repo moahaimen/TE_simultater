@@ -50,6 +50,7 @@ OUTPUT_DIR = Path("results/dynamic_metagate")
 GNN_CHECKPOINT = Path("results/phase1_reactive/gnn_selector/train/gnn_selector/gnn_selector.pt")
 
 SELECTOR_NAMES = ["bottleneck", "topk", "sensitivity", "gnn"]
+NUM_SELECTORS = len(SELECTOR_NAMES)
 KNOWN_TOPOLOGIES = {"abilene", "geant", "cernet", "rocketfuel_ebone",
                     "rocketfuel_sprintlink", "rocketfuel_tiscali"}
 UNSEEN_TOPOLOGIES = {"germany50", "topologyzoo_vtlwavenet2011"}
@@ -379,9 +380,10 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("  4-EXPERT MLP METAGATE EVALUATION")
+    print("  4-EXPERT MLP METAGATE EVALUATION (with per-topology calibration)")
     print("  Experts: {Bottleneck, TopK, Sensitivity, GNN}")
     print("  Unified gate trained on 6 known topologies")
+    print("  Per-topology calibration: 10 val TMs -> Bayesian prior fusion")
     print("  Unseen test: Germany50, VtlWavenet2011")
     print("=" * 70)
 
@@ -504,10 +506,11 @@ def main():
     print(f"  Model saved to {model_dir / 'metagate_unified.pt'}")
 
     # ================================================================
-    # PHASE 3: Evaluate on ALL topologies (known + unseen)
+    # PHASE 3: Per-topology calibration + evaluation on ALL 8 topologies
     # ================================================================
+    N_CALIB = 10  # number of val TMs for calibration
     print("\n" + "=" * 70)
-    print("  PHASE 3: Evaluating on ALL 8 topologies")
+    print(f"  PHASE 3: Calibration ({N_CALIB} val TMs) + Evaluation on ALL 8 topologies")
     print("=" * 70)
 
     all_results = []
@@ -517,6 +520,27 @@ def main():
         ds_key = dataset.key
         topo_type = "UNSEEN" if ds_key in UNSEEN_TOPOLOGIES else "known"
         print(f"\n  [{topo_type}] {ds_key}...")
+
+        # --- Calibration: run N_CALIB val TMs through all 4 experts + LP ---
+        val_indices = M["split_indices"](dataset, "val")
+        calib_indices = val_indices[:N_CALIB]
+        print(f"    Calibrating on {len(calib_indices)} val TMs...")
+        try:
+            _, calib_labels, _, _ = compute_features_and_oracle_for_topology(
+                M, dataset, pl, calib_indices, gnn_model, K_CRIT,
+            )
+            if len(calib_labels) > 0:
+                win_counts = np.bincount(calib_labels, minlength=NUM_SELECTORS)
+                gate.calibrate(win_counts, smoothing=1.0, strength=5.0)
+                prior = gate._calibration_prior
+                print(f"    Calibration prior: BN={prior[0]:.2f} TopK={prior[1]:.2f} "
+                      f"Sens={prior[2]:.2f} GNN={prior[3]:.2f}")
+            else:
+                gate.clear_calibration()
+                print(f"    No valid calibration TMs, using raw MLP predictions")
+        except Exception as e:
+            print(f"    Calibration failed: {e}, using raw MLP predictions")
+            gate.clear_calibration()
 
         try:
             results, decisions = evaluate_on_topology(

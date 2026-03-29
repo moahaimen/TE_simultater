@@ -41,6 +41,7 @@ from phase1_reactive.drl.meta_selector import (
     train_meta_gate,
     load_meta_gate,
     rollout_unified_selector,
+    rollout_forced_expert_selector,
     rollout_oracle_selector,
     META_FEATURE_DIM,
 )

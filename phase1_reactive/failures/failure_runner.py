@@ -54,6 +54,18 @@ def _test_indices(dataset) -> list[int]:
     return list(range(int(dataset.split["test_start"]), int(dataset.tm.shape[0])))
 
 
+def _select_gnn_indices(tm_vector, dataset, path_library, capacities, k_crit, gnn_model, telemetry=None, failure_mask=None, device="cpu"):
+    """Select critical flows using the GNN selector under failure conditions."""
+    from phase1_reactive.drl.gnn_selector import build_graph_tensors, build_od_features
+    graph_data = build_graph_tensors(dataset, telemetry=telemetry, failure_mask=failure_mask, device=device)
+    od_data = build_od_features(dataset, tm_vector, path_library, telemetry=telemetry, device=device)
+    active_mask = (np.asarray(tm_vector, dtype=np.float64) > 1e-12).astype(np.float32)
+    selected, _ = gnn_model.select_critical_flows(
+        graph_data, od_data, active_mask=active_mask, k_crit_default=k_crit,
+    )
+    return selected
+
+
 def _select_indices(method: str, tm_vector: np.ndarray, ecmp_policy, path_library, capacities: np.ndarray, k_crit: int, prev_selected=None, failure_mask=None) -> list[int]:
     key = str(method).lower()
     if key == "topk":
@@ -147,7 +159,7 @@ def _evaluate_candidate(tm_vector, selected, ecmp_base, current_paths, current_c
     return lp, routing, telemetry, float(disturbance)
 
 
-def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: str, failure_start: int, k_paths: int, k_crit: int, lp_time_limit_sec: int, telemetry_cfg, checkpoint_paths: dict[str, Path]) -> pd.DataFrame:
+def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: str, failure_start: int, k_paths: int, k_crit: int, lp_time_limit_sec: int, telemetry_cfg, checkpoint_paths: dict[str, Path], gnn_model=None) -> pd.DataFrame:
     failed_edges = _pick_failure_edges(dataset, base_paths, failure_start, failure_type)
     post_failure = _build_failure_state(dataset, base_paths, failure_type, failed_edges, k_paths)
     method = PPO_METHOD if str(method) == "our_drl" else str(method)
@@ -245,6 +257,22 @@ def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: s
                     gate_choice = str(gate_info.get("gate_choice", "unknown"))
                     lp, routing, telemetry, disturbance = _evaluate_candidate(tm_vector, selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec, telemetry_cfg)
             inference_latency = time.perf_counter() - inf_start
+            final_splits = lp.splits
+            lp_runtime = 0.0
+            status = str(lp.status)
+        elif method == "our_gnn_selector" and gnn_model is not None:
+            # GNN selector under failure conditions
+            state_splits = _state_splits_for_paths(prev_splits, current_paths)
+            state_routing = apply_routing(tm_vector, state_splits, current_paths, current_caps)
+            state_telemetry = compute_reactive_telemetry(tm_vector, state_splits, current_paths, state_routing, current_weights, prev_latency_by_od=prev_latency_by_od, cfg=telemetry_cfg)
+            inf_start = time.perf_counter()
+            with torch.no_grad():
+                selected = _select_gnn_indices(
+                    tm_vector, dataset, current_paths, current_caps, k_crit,
+                    gnn_model, telemetry=state_telemetry, failure_mask=failure_mask,
+                )
+            inference_latency = time.perf_counter() - inf_start
+            lp, routing, telemetry, disturbance = _evaluate_candidate(tm_vector, selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec, telemetry_cfg)
             final_splits = lp.splits
             lp_runtime = 0.0
             status = str(lp.status)

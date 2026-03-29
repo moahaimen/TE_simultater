@@ -7,7 +7,7 @@ Training approach:
   3. Loss = listwise ranking loss (approx-NDCG) + LP-aware REINFORCE
   4. Curriculum: start with small topologies, add larger ones progressively
 
-The GNN learns to CORRECT FlexDATE's scoring, not replace it from scratch.
+The GNN learns to CORRECT internal heuristic scoring (Bottleneck + Sensitivity blend).
 """
 
 from __future__ import annotations
@@ -75,15 +75,9 @@ def _collect_oracle_labels(
         "sensitivity": lambda: select_sensitivity_critical(tm_vector, ecmp_base, path_library, capacities, k_crit),
     }
 
-    # Add FlexDATE
-    try:
-        from phase1_reactive.baselines.literature_baselines import select_literature_baseline
-        selectors["flexdate"] = lambda: select_literature_baseline(
-            "flexdate", tm_vector=tm_vector, ecmp_policy=ecmp_base,
-            path_library=path_library, capacities=capacities, k_crit=k_crit,
-        )
-    except ImportError:
-        pass
+    # NOTE: FlexDATE and other published methods are excluded from oracle
+    # label generation per requirements. Only internal selectors (topk,
+    # bottleneck, sensitivity) compete for oracle labels.
 
     all_results = {}
     best_mlu = float("inf")

@@ -288,11 +288,34 @@ class DynamicMetaGate:
             preds = logits.argmax(dim=1).numpy()
         return float((preds == labels).mean())
 
-    def predict(self, features: np.ndarray) -> Tuple[int, np.ndarray]:
-        """Predict which expert to use.
+    def calibrate(self, expert_win_counts: np.ndarray, smoothing: float = 1.0,
+                  strength: float = 3.0):
+        """Set a calibration prior from a small validation run on the target topology.
 
-        Returns: (predicted_class, probabilities) where classes are
-                 {0=BN, 1=TopK, 2=Sens, 3=GNN}
+        Args:
+            expert_win_counts: array of how many times each expert won on calibration set.
+            smoothing: Laplace smoothing to avoid zero priors.
+            strength: exponent applied to prior before fusion. Higher = trust calibration more.
+                      At strength=1, standard Bayesian fusion. At strength=3, calibration
+                      dominates over MLP when prior is strongly skewed.
+
+        Combined with MLP via: final_prob[i] = MLP_prob[i] * prior[i]^strength / Z
+        """
+        counts = np.array(expert_win_counts, dtype=np.float64) + smoothing
+        self._calibration_prior = counts / counts.sum()
+        self._calibration_strength = strength
+        logger.info(f"MetaGate calibrated: prior={self._calibration_prior}, strength={strength}")
+
+    def clear_calibration(self):
+        """Remove calibration prior."""
+        self._calibration_prior = None
+
+    def predict(self, features: np.ndarray) -> Tuple[int, np.ndarray]:
+        """Predict which expert to use, with optional calibration fusion.
+
+        If calibration prior is set: final_prob[i] = MLP_prob[i] * prior[i] / Z
+
+        Returns: (predicted_class, probabilities)
         """
         import torch
 
@@ -304,6 +327,14 @@ class DynamicMetaGate:
         with torch.no_grad():
             logits = self.model(X_t)
             probs = torch.softmax(logits, dim=1).numpy()[0]
+
+        if hasattr(self, '_calibration_prior') and self._calibration_prior is not None:
+            alpha = getattr(self, '_calibration_strength', 1.0)
+            boosted_prior = self._calibration_prior ** alpha
+            fused = probs * boosted_prior
+            fused = fused / (fused.sum() + 1e-12)
+            return int(np.argmax(fused)), fused
+
         return int(np.argmax(probs)), probs
 
     def save(self, path: Path):
