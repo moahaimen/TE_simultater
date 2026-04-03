@@ -49,8 +49,11 @@ K_CRIT = 40
 LT = 20
 DEVICE = "cpu"
 N_CALIB = 10
+SOFT_LABEL_TEMPERATURE = 0.05
+REGRET_LOSS_WEIGHT = 0.25
+REGRET_CLIP = 10.0
 
-OUTPUT_DIR = Path("results/dynamic_metagate_gnnplus")
+OUTPUT_DIR = Path(os.environ.get("METAGATE_GNNPLUS_OUTPUT_DIR", "results/dynamic_metagate_gnnplus"))
 MODEL_DIR = OUTPUT_DIR / "models"
 GNNPLUS_CHECKPOINT = Path("results/gnn_plus_retrained_fixedk40/gnn_plus_fixed_k40.pt")
 GNNPLUS_SOURCE_CHECKPOINT = Path("results/gnn_plus/stage1_regularization/training_d02/final.pt")
@@ -217,6 +220,38 @@ def compute_expert_mlus(M, tm, selector_results, ecmp_base, path_library, capaci
     return mlus
 
 
+def build_soft_targets_and_regret_costs(
+    mlu_records: list[dict[str, float]],
+    temperature: float = SOFT_LABEL_TEMPERATURE,
+    regret_clip: float = REGRET_CLIP,
+) -> tuple[np.ndarray, np.ndarray]:
+    soft_targets = []
+    regret_rows = []
+    temp = max(float(temperature), 1e-6)
+
+    for mlus in mlu_records:
+        values = np.array([float(mlus[name]) for name in SELECTOR_NAMES], dtype=np.float64)
+        finite = np.isfinite(values)
+        if not np.any(finite):
+            regrets = np.ones(len(SELECTOR_NAMES), dtype=np.float32)
+            targets = np.ones(len(SELECTOR_NAMES), dtype=np.float32) / len(SELECTOR_NAMES)
+        else:
+            finite_values = values[finite]
+            best = float(np.min(finite_values))
+            denom = max(abs(best), 1e-6)
+            regrets = np.full(len(SELECTOR_NAMES), regret_clip, dtype=np.float64)
+            regrets[finite] = np.clip((values[finite] - best) / denom, 0.0, regret_clip)
+            logits = -regrets / temp
+            logits[~finite] = -1e9
+            logits = logits - np.max(logits)
+            probs = np.exp(logits)
+            targets = probs / max(np.sum(probs), 1e-12)
+        soft_targets.append(np.asarray(targets, dtype=np.float32))
+        regret_rows.append(np.asarray(regrets, dtype=np.float32))
+
+    return np.stack(soft_targets), np.stack(regret_rows)
+
+
 def compute_features_and_oracle_for_topology(M, dataset, path_library, timesteps, gnnplus_model, k_crit):
     ecmp_base = M["ecmp_splits"](path_library)
     capacities = np.asarray(dataset.capacities, dtype=float)
@@ -273,13 +308,23 @@ def compute_features_and_oracle_for_topology(M, dataset, path_library, timesteps
         mlu_records.append(mlus)
 
     if features_list:
+        soft_targets, regret_costs = build_soft_targets_and_regret_costs(mlu_records)
         return (
             np.stack(features_list),
             np.array(labels_list, dtype=np.int64),
             valid_timesteps,
             mlu_records,
+            soft_targets,
+            regret_costs,
         )
-    return np.zeros((0, 49)), np.array([], dtype=np.int64), [], []
+    return (
+        np.zeros((0, 49)),
+        np.array([], dtype=np.int64),
+        [],
+        [],
+        np.zeros((0, NUM_SELECTORS), dtype=np.float32),
+        np.zeros((0, NUM_SELECTORS), dtype=np.float32),
+    )
 
 
 def build_oracle_rows(dataset_key: str, timesteps: list[int], labels: np.ndarray, mlu_records: list[dict[str, float]]):
@@ -479,8 +524,12 @@ def main():
 
     all_train_X = []
     all_train_y = []
+    all_train_soft = []
+    all_train_regret = []
     all_val_X = []
     all_val_y = []
+    all_val_soft = []
+    all_val_regret = []
     train_distribution_rows = []
 
     print("\n" + "=" * 72)
@@ -493,7 +542,7 @@ def main():
 
         print(f"\n  {ds_key}: computing oracle for {len(train_indices)} train TMs...")
         t0 = time.time()
-        train_X, train_y, train_ts, train_mlus = compute_features_and_oracle_for_topology(
+        train_X, train_y, train_ts, train_mlus, train_soft, train_regret = compute_features_and_oracle_for_topology(
             M,
             dataset,
             pl,
@@ -522,9 +571,11 @@ def main():
             )
             all_train_X.append(train_X)
             all_train_y.append(train_y)
+            all_train_soft.append(train_soft)
+            all_train_regret.append(train_regret)
 
         print(f"    Computing val oracle for {len(val_indices)} TMs...")
-        val_X, val_y, val_ts, val_mlus = compute_features_and_oracle_for_topology(
+        val_X, val_y, val_ts, val_mlus, val_soft, val_regret = compute_features_and_oracle_for_topology(
             M,
             dataset,
             pl,
@@ -536,11 +587,17 @@ def main():
         if len(val_X) > 0:
             all_val_X.append(val_X)
             all_val_y.append(val_y)
+            all_val_soft.append(val_soft)
+            all_val_regret.append(val_regret)
 
     pooled_train_X = np.concatenate(all_train_X, axis=0)
     pooled_train_y = np.concatenate(all_train_y, axis=0)
+    pooled_train_soft = np.concatenate(all_train_soft, axis=0)
+    pooled_train_regret = np.concatenate(all_train_regret, axis=0)
     pooled_val_X = np.concatenate(all_val_X, axis=0) if all_val_X else None
     pooled_val_y = np.concatenate(all_val_y, axis=0) if all_val_y else None
+    pooled_val_soft = np.concatenate(all_val_soft, axis=0) if all_val_soft else None
+    pooled_val_regret = np.concatenate(all_val_regret, axis=0) if all_val_regret else None
 
     print(f"\n  Pooled training set: {len(pooled_train_X)} samples from {len(known_datasets)} topologies")
     print(f"  Pooled validation set: {len(pooled_val_X) if pooled_val_X is not None else 0} samples")
@@ -561,9 +618,22 @@ def main():
         learning_rate=5e-4,
         num_epochs=300,
         batch_size=64,
+        use_soft_labels=True,
+        soft_label_temperature=SOFT_LABEL_TEMPERATURE,
+        regret_loss_weight=REGRET_LOSS_WEIGHT,
+        regret_clip=REGRET_CLIP,
     )
     gate = M["DynamicMetaGate"](config)
-    train_acc, val_acc = gate.train(pooled_train_X, pooled_train_y, pooled_val_X, pooled_val_y)
+    train_acc, val_acc = gate.train(
+        pooled_train_X,
+        pooled_train_y,
+        pooled_val_X,
+        pooled_val_y,
+        soft_targets=pooled_train_soft,
+        regret_costs=pooled_train_regret,
+        val_soft_targets=pooled_val_soft,
+        val_regret_costs=pooled_val_regret,
+    )
     print(f"  Train accuracy: {train_acc:.3f}")
     print(f"  Val accuracy:   {val_acc:.3f}")
 
@@ -588,7 +658,7 @@ def main():
         calib_indices = val_indices[:N_CALIB]
         print(f"    Calibrating on {len(calib_indices)} val TMs...")
         try:
-            _, calib_labels, _, _ = compute_features_and_oracle_for_topology(
+            _, calib_labels, _, _, _, _ = compute_features_and_oracle_for_topology(
                 M,
                 dataset,
                 pl,
@@ -633,7 +703,7 @@ def main():
 
         test_indices = M["split_indices"](dataset, "test")
         print(f"    Computing test oracle for {len(test_indices)} TMs...")
-        _, test_y, test_ts, test_mlus = compute_features_and_oracle_for_topology(
+        _, test_y, test_ts, test_mlus, _, _ = compute_features_and_oracle_for_topology(
             M,
             dataset,
             pl,
@@ -775,6 +845,10 @@ def main():
             "learning_rate": float(config.learning_rate),
             "num_epochs": int(config.num_epochs),
             "batch_size": int(config.batch_size),
+            "use_soft_labels": bool(config.use_soft_labels),
+            "soft_label_temperature": float(config.soft_label_temperature),
+            "regret_loss_weight": float(config.regret_loss_weight),
+            "regret_clip": float(config.regret_clip),
         },
         "pooled_train_samples": int(len(pooled_train_X)),
         "pooled_val_samples": int(len(pooled_val_X) if pooled_val_X is not None else 0),

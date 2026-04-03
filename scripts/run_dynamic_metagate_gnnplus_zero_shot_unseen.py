@@ -29,7 +29,12 @@ from scripts.run_dynamic_metagate_gnnplus_eval import (
     evaluate_on_topology,
 )
 
-OUTPUT_DIR = PROJECT_ROOT / "results" / "dynamic_metagate_gnnplus"
+OUTPUT_DIR = Path(
+    os.environ.get(
+        "METAGATE_GNNPLUS_OUTPUT_DIR",
+        str(PROJECT_ROOT / "results" / "dynamic_metagate_gnnplus"),
+    )
+).resolve()
 MODEL_PATH = OUTPUT_DIR / "models" / "metagate_gnnplus_unified.pt"
 ORACLE_CSV = OUTPUT_DIR / "test_oracle.csv"
 ZERO_SHOT_RESULTS_CSV = OUTPUT_DIR / "zero_shot_unseen_results.csv"

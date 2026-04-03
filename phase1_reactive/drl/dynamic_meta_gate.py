@@ -43,6 +43,10 @@ class MetaGateConfig:
     learning_rate: float = 1e-3
     num_epochs: int = 100
     batch_size: int = 32
+    use_soft_labels: bool = False
+    soft_label_temperature: float = 0.05
+    regret_loss_weight: float = 0.0
+    regret_clip: float = 10.0
 
 
 @dataclass
@@ -200,17 +204,34 @@ class DynamicMetaGate:
         self.scaler_std = None
         self._is_trained = False
 
-    def train(self, features: np.ndarray, labels: np.ndarray, val_features=None, val_labels=None):
+    def train(
+        self,
+        features: np.ndarray,
+        labels: np.ndarray,
+        val_features=None,
+        val_labels=None,
+        *,
+        soft_targets: np.ndarray | None = None,
+        regret_costs: np.ndarray | None = None,
+        val_soft_targets: np.ndarray | None = None,
+        val_regret_costs: np.ndarray | None = None,
+    ):
         """Train the meta-gate classifier.
 
         Args:
             features: [N, feat_dim] feature matrix
             labels: [N] integer labels {0=BN, 1=TopK, 2=Sens, 3=GNN}
+            soft_targets: optional [N, 4] probability targets derived from expert MLUs
+            regret_costs: optional [N, 4] normalized regret matrix used for routing-aware loss
 
-        Uses inverse-frequency class weights to prevent majority-class collapse.
+        Uses inverse-frequency sample weights to reduce majority-class collapse.
+        When soft_targets are provided, the primary training loss becomes soft cross-entropy.
+        When regret_costs are provided, an expected-regret term is added so catastrophic
+        mistakes are penalized more than near-ties.
         """
         import torch
         import torch.nn as nn
+        import torch.nn.functional as F
 
         self.scaler_mean = features.mean(axis=0)
         self.scaler_std = features.std(axis=0) + 1e-8
@@ -237,15 +258,24 @@ class DynamicMetaGate:
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config.learning_rate,
                                      weight_decay=1e-4)
 
-        # Compute inverse-frequency class weights to handle imbalanced oracle labels
+        # Inverse-frequency sample weights reduce majority-class domination without
+        # forcing a hard one-hot target when the oracle is near-tied.
         class_counts = np.bincount(y, minlength=NUM_SELECTORS).astype(np.float64)
         class_counts = np.maximum(class_counts, 1.0)
         class_weights = len(y) / (NUM_SELECTORS * class_counts)
-        class_weights_t = torch.tensor(class_weights, dtype=torch.float32)
-        criterion = nn.CrossEntropyLoss(weight=class_weights_t)
+        sample_weights = class_weights[y]
 
         X_t = torch.tensor(X, dtype=torch.float32)
         y_t = torch.tensor(y, dtype=torch.long)
+        sample_weights_t = torch.tensor(sample_weights, dtype=torch.float32)
+        soft_targets_t = (
+            torch.tensor(np.asarray(soft_targets, dtype=np.float32), dtype=torch.float32)
+            if soft_targets is not None else None
+        )
+        regret_costs_t = (
+            torch.tensor(np.asarray(regret_costs, dtype=np.float32), dtype=torch.float32)
+            if regret_costs is not None else None
+        )
 
         best_val_acc = 0.0
         best_state = None
@@ -257,7 +287,18 @@ class DynamicMetaGate:
             for i in range(0, len(X_t), self.config.batch_size):
                 idx = perm[i:i + self.config.batch_size]
                 logits = self.model(X_t[idx])
-                loss = criterion(logits, y_t[idx])
+                if self.config.use_soft_labels and soft_targets_t is not None:
+                    target_batch = soft_targets_t[idx]
+                    primary_loss = -(target_batch * F.log_softmax(logits, dim=1)).sum(dim=1)
+                else:
+                    primary_loss = F.cross_entropy(logits, y_t[idx], reduction="none")
+
+                if regret_costs_t is not None and self.config.regret_loss_weight > 0.0:
+                    probs = torch.softmax(logits, dim=1)
+                    regret_term = (probs * regret_costs_t[idx]).sum(dim=1)
+                    primary_loss = primary_loss + self.config.regret_loss_weight * regret_term
+
+                loss = (primary_loss * sample_weights_t[idx]).mean()
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -349,6 +390,10 @@ class DynamicMetaGate:
             "config": {
                 "hidden_dim": self.config.hidden_dim,
                 "dropout": self.config.dropout,
+                "use_soft_labels": self.config.use_soft_labels,
+                "soft_label_temperature": self.config.soft_label_temperature,
+                "regret_loss_weight": self.config.regret_loss_weight,
+                "regret_clip": self.config.regret_clip,
             },
             "selector_names": SELECTOR_NAMES,
             "num_selectors": NUM_SELECTORS,
@@ -360,7 +405,7 @@ class DynamicMetaGate:
         import torch
         import torch.nn as nn
 
-        payload = torch.load(str(path), map_location="cpu")
+        payload = torch.load(str(path), map_location="cpu", weights_only=False)
         self.scaler_mean = payload["scaler_mean"]
         self.scaler_std = payload["scaler_std"]
 

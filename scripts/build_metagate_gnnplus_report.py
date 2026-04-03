@@ -21,10 +21,31 @@ from docx.shared import Inches, Pt, RGBColor
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 os.chdir(PROJECT_ROOT)
 
-OUTPUT_DIR = PROJECT_ROOT / "results" / "dynamic_metagate_gnnplus"
+OUTPUT_DIR = Path(
+    os.environ.get(
+        "METAGATE_GNNPLUS_REPORT_INPUT_DIR",
+        str(PROJECT_ROOT / "results" / "dynamic_metagate_gnnplus"),
+    )
+).resolve()
 PLOTS_DIR = OUTPUT_DIR / "plots"
-OUTPUT_DOC = OUTPUT_DIR / "MLP_MetaGate_GNNPLUS_Final_Report_ZeroShotObjective_Updated.docx"
-AUDIT_MD = OUTPUT_DIR / "report_audit_zeroshot_objective_updated.md"
+DEFAULT_DOC_NAME = (
+    "MLP_MetaGate_GNNPLUS_Final_Report_SoftLabels_Regret_Updated.docx"
+    if OUTPUT_DIR.name.endswith("softloss")
+    else "MLP_MetaGate_GNNPLUS_Final_Report_ZeroShotObjective_Updated.docx"
+)
+OUTPUT_DOC = OUTPUT_DIR / os.environ.get("METAGATE_GNNPLUS_REPORT_NAME", DEFAULT_DOC_NAME)
+DEFAULT_AUDIT_NAME = (
+    "report_audit_softlabels_regret_updated.md"
+    if OUTPUT_DIR.name.endswith("softloss")
+    else "report_audit_zeroshot_objective_updated.md"
+)
+AUDIT_MD = OUTPUT_DIR / os.environ.get("METAGATE_GNNPLUS_REPORT_AUDIT", DEFAULT_AUDIT_NAME)
+COMPARE_DIR = Path(
+    os.environ.get(
+        "METAGATE_GNNPLUS_COMPARE_DIR",
+        str(PROJECT_ROOT / "results" / "dynamic_metagate_gnnplus"),
+    )
+).resolve()
 
 RESULTS_CSV = OUTPUT_DIR / "metagate_results.csv"
 DECISIONS_CSV = OUTPUT_DIR / "metagate_decisions.csv"
@@ -38,6 +59,9 @@ FAILURE_RESULTS_CSV = OUTPUT_DIR / "metagate_failure_results.csv"
 FAILURE_SUMMARY_CSV = OUTPUT_DIR / "metagate_failure_summary.csv"
 FAILURE_CALIB_CSV = OUTPUT_DIR / "metagate_failure_calibration.csv"
 ZERO_SHOT_UNSEEN_SUMMARY_CSV = OUTPUT_DIR / "zero_shot_unseen_summary.csv"
+COMPARE_SUMMARY_CSV = COMPARE_DIR / "metagate_summary.csv"
+COMPARE_RESULTS_CSV = COMPARE_DIR / "metagate_results.csv"
+COMPARE_TRAINING_SUMMARY_JSON = COMPARE_DIR / "training_summary.json"
 
 TOPOLOGY_ORDER = [
     "abilene",
@@ -227,6 +251,20 @@ def load_inputs():
     return results, decisions, summary, timing, calib, train_dist, oracle, training_summary, failure_results, failure_summary, failure_calib, zero_shot_unseen
 
 
+def load_compare_inputs():
+    if COMPARE_DIR == OUTPUT_DIR:
+        return None, None, None
+    if not COMPARE_SUMMARY_CSV.exists() or not COMPARE_RESULTS_CSV.exists() or not COMPARE_TRAINING_SUMMARY_JSON.exists():
+        return None, None, None
+    compare_summary = pd.read_csv(COMPARE_SUMMARY_CSV)
+    compare_results = pd.read_csv(COMPARE_RESULTS_CSV)
+    compare_training = json.loads(COMPARE_TRAINING_SUMMARY_JSON.read_text(encoding="utf-8"))
+    for frame in [compare_summary, compare_results]:
+        if "dataset" in frame.columns:
+            frame["topology"] = frame["dataset"].map(canon)
+    return compare_summary, compare_results, compare_training
+
+
 def plot_selector_distribution(results: pd.DataFrame) -> Path:
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     path = PLOTS_DIR / "selector_distribution_gnnplus.png"
@@ -343,8 +381,32 @@ def plot_failure_selector_mix(failure_results: pd.DataFrame) -> Path:
     return path
 
 
+def plot_before_after_accuracy(compare_summary: pd.DataFrame, summary: pd.DataFrame) -> Path:
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = PLOTS_DIR / "accuracy_before_after_softloss.png"
+    old_df = compare_summary.set_index("topology").reindex(TOPOLOGY_ORDER)
+    new_df = summary.set_index("topology").reindex(TOPOLOGY_ORDER)
+    x = np.arange(len(TOPOLOGY_ORDER))
+    width = 0.38
+    fig, ax = plt.subplots(figsize=(10.8, 4.8))
+    ax.bar(x - width / 2, old_df["accuracy"].to_numpy() * 100.0, width=width, label="Previous hard-label gate", color="#9aa0a6")
+    ax.bar(x + width / 2, new_df["accuracy"].to_numpy() * 100.0, width=width, label="Soft-label + regret gate", color="#1f77b4")
+    ax.set_xticks(x)
+    ax.set_xticklabels([TOPOLOGY_INFO[t]["display"] for t in TOPOLOGY_ORDER], rotation=20, ha="right")
+    ax.set_ylabel("Accuracy (%)")
+    ax.set_title("Before vs After: Exact Expert Accuracy by Topology")
+    ax.set_ylim(0, 100)
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def build_report():
     results, decisions, summary, timing, calib, train_dist, oracle, training_summary, failure_results, failure_summary, failure_calib, zero_shot_unseen = load_inputs()
+    compare_summary, compare_results, compare_training = load_compare_inputs()
 
     summary = summary.set_index("topology").reindex(TOPOLOGY_ORDER).reset_index()
     timing = timing.set_index("topology").reindex(TOPOLOGY_ORDER).reset_index()
@@ -354,6 +416,7 @@ def build_report():
     acc_gap_plot = plot_accuracy_gap(summary)
     germany_plot = plot_germany50_selection(results, oracle)
     failure_plot = plot_failure_selector_mix(failure_results) if not failure_results.empty else None
+    before_after_plot = plot_before_after_accuracy(compare_summary, summary) if compare_summary is not None else None
 
     overall_acc = float(training_summary["overall_test_accuracy"]) * 100.0
     known_acc = float(training_summary["known_test_accuracy"]) * 100.0
@@ -371,14 +434,14 @@ def build_report():
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run("MLP Meta-Gate with Few-Shot Bayesian Calibration")
+    run = title.add_run("MLP Meta-Gate with Soft Labels, Regret Loss, and Few-Shot Bayesian Calibration")
     run.bold = True
     run.font.size = Pt(20)
     run.font.color.rgb = RGBColor(0x1A, 0x3C, 0x6E)
 
     subtitle = doc.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = subtitle.add_run("Final Evaluation Report (GNN+ Expert Version)")
+    run = subtitle.add_run("Final Evaluation Report (GNN+ Expert Version, Improved Training)")
     run.font.size = Pt(14)
     run.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
 
@@ -386,7 +449,8 @@ def build_report():
     subtitle2.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = subtitle2.add_run(
         "Architecture: 4-Expert Selection via MLP Gate with Per-Topology Bayesian Calibration\n"
-        "Expert pool: Bottleneck, TopK, Sensitivity, GNN+"
+        "Expert pool: Bottleneck, TopK, Sensitivity, GNN+\n"
+        "Training upgrade: soft labels from expert MLUs + routing-aware regret penalty"
     )
     run.font.size = Pt(11)
     run.italic = True
@@ -405,6 +469,12 @@ def build_report():
         "which expert achieves the lowest MLU, and fusing this topology-specific prior with the MLP "
         "softmax output. No gradient updates occur during calibration."
     )
+    doc.add_paragraph(
+        "In the updated training pipeline, the hard one-hot oracle target is replaced with a soft target "
+        "distribution derived from the relative MLU regret of all 4 experts. A routing-aware regret term "
+        "is added to the loss so the gate is penalized much more for assigning probability to catastrophic "
+        "experts than for being torn between two nearly identical good experts."
+    )
     p = doc.add_paragraph()
     bold_run(p, "Key results: ")
     p.add_run(
@@ -413,6 +483,14 @@ def build_report():
         f"accuracy {germany_summary['accuracy'] * 100.0:.1f}%. Overall accuracy {overall_acc:.1f}% across 8 topologies. "
         f"Mean selector decision overhead {mean_decision:.1f} ms; mean end-to-end time (including LP) {mean_total:.1f} ms."
     )
+    if compare_training is not None:
+        p = doc.add_paragraph()
+        bold_run(p, "Improvement snapshot: ")
+        p.add_run(
+            f"overall exact accuracy improved from {float(compare_training['overall_test_accuracy']) * 100.0:.1f}% "
+            f"to {overall_acc:.1f}%, and unseen-topology accuracy improved from "
+            f"{float(compare_training['unseen_test_accuracy']) * 100.0:.1f}% to {unseen_acc:.1f}% after the soft-label/regret update."
+        )
 
     doc.add_heading("1. Contributions", level=1)
     items = [
@@ -499,11 +577,82 @@ def build_report():
             ["Learning rate", str(training_summary["metagate_config"]["learning_rate"])],
             ["Epochs", str(training_summary["metagate_config"]["num_epochs"])],
             ["Batch size", str(training_summary["metagate_config"]["batch_size"])],
+            ["Soft labels enabled", str(training_summary["metagate_config"].get("use_soft_labels", False))],
+            ["Soft-label temperature", str(training_summary["metagate_config"].get("soft_label_temperature", "N/A"))],
+            ["Regret loss weight", str(training_summary["metagate_config"].get("regret_loss_weight", "N/A"))],
+            ["Regret clip", str(training_summary["metagate_config"].get("regret_clip", "N/A"))],
             ["Train accuracy", f"{float(training_summary['train_accuracy']) * 100.0:.1f}%"],
             ["Validation accuracy", f"{float(training_summary['val_accuracy']) * 100.0:.1f}%"],
             ["GNN+ checkpoint", training_summary["gnnplus_checkpoint"]],
         ],
     )
+    doc.add_heading("3.1 What Improved and How", level=2)
+    doc.add_paragraph(
+        "The previous MetaGate+GNN+ version used hard one-hot oracle labels. That made the gate look wrong on "
+        "tie-heavy topologies such as Abilene and Ebone, even when the chosen expert achieved nearly the same "
+        "MLU as the oracle. The improved version changes two things:"
+    )
+    doc.add_paragraph(
+        "1) Soft labels: expert MLUs are converted into a probability target, so two near-oracle experts can "
+        "both receive high probability instead of forcing a fake single winner.",
+        style="List Number",
+    )
+    doc.add_paragraph(
+        "2) Routing-aware regret loss: the training loss now adds a penalty proportional to the expected MLU "
+        "regret, so the gate learns that close misses are acceptable but high-regret experts should be suppressed.",
+        style="List Number",
+    )
+    if compare_summary is not None and compare_training is not None:
+        overall_gap_old = (
+            (compare_summary["metagate_mlu"].mean() - compare_summary["oracle_mlu"].mean())
+            / compare_summary["oracle_mlu"].mean()
+            * 100.0
+        )
+        overall_gap_new = (
+            (summary["metagate_mlu"].mean() - summary["oracle_mlu"].mean())
+            / summary["oracle_mlu"].mean()
+            * 100.0
+        )
+        add_table(
+            doc,
+            ["Metric", "Previous Hard-Label Gate", "Updated Soft-Label + Regret Gate"],
+            [
+                ["Overall accuracy", f"{float(compare_training['overall_test_accuracy']) * 100.0:.1f}%", f"{overall_acc:.1f}%"],
+                ["Known-topology accuracy", f"{float(compare_training['known_test_accuracy']) * 100.0:.1f}%", f"{known_acc:.1f}%"],
+                ["Unseen-topology accuracy", f"{float(compare_training['unseen_test_accuracy']) * 100.0:.1f}%", f"{unseen_acc:.1f}%"],
+                ["Mean oracle gap", fmt_pct(overall_gap_old), fmt_pct(overall_gap_new)],
+            ],
+        )
+        improvement_rows = []
+        merged = compare_summary[["topology", "accuracy", "metagate_mlu", "oracle_mlu"]].merge(
+            summary[["topology", "accuracy", "metagate_mlu", "oracle_mlu"]],
+            on="topology",
+            suffixes=("_old", "_new"),
+        )
+        for topo in TOPOLOGY_ORDER:
+            row = merged[merged["topology"] == topo]
+            if row.empty:
+                continue
+            rec = row.iloc[0]
+            old_gap = (float(rec["metagate_mlu_old"]) - float(rec["oracle_mlu_old"])) / float(rec["oracle_mlu_old"]) * 100.0
+            new_gap = (float(rec["metagate_mlu_new"]) - float(rec["oracle_mlu_new"])) / float(rec["oracle_mlu_new"]) * 100.0
+            improvement_rows.append(
+                [
+                    topo_label(topo),
+                    f"{float(rec['accuracy_old']) * 100.0:.1f}%",
+                    f"{float(rec['accuracy_new']) * 100.0:.1f}%",
+                    f"{(float(rec['accuracy_new']) - float(rec['accuracy_old'])) * 100.0:+.1f} pts",
+                    fmt_pct(old_gap),
+                    fmt_pct(new_gap),
+                ]
+            )
+        add_table(
+            doc,
+            ["Topology", "Old Acc", "New Acc", "Delta", "Old Gap", "New Gap"],
+            improvement_rows,
+        )
+        if before_after_plot is not None:
+            add_image(doc, before_after_plot, "Before vs after exact-expert accuracy after soft-label and regret-loss training.")
 
     doc.add_heading("4. Few-Shot Bayesian Calibration", level=1)
     doc.add_paragraph(
@@ -800,10 +949,12 @@ def build_report():
         "# MetaGate GNN+ Report Audit",
         "",
         f"- Output report: `{OUTPUT_DOC.relative_to(PROJECT_ROOT)}`",
-        "- This report is built only from `results/dynamic_metagate_gnnplus/*` outputs.",
+        f"- This report is built from `{OUTPUT_DIR.relative_to(PROJECT_ROOT)}` outputs.",
         "- The learned expert in this report is GNN+, not the old Original GNN.",
         "- Selector percentages and accuracy values come from the new integrated MetaGate+GNN+ evaluation.",
         f"- Failure section included: {'yes' if not failure_results.empty else 'no'}",
+        f"- Compared against previous bundle: `{COMPARE_DIR.relative_to(PROJECT_ROOT)}`" if COMPARE_DIR != OUTPUT_DIR else "- Compared against previous bundle: no",
+        "- Training upgrade documented: soft labels from expert MLUs and routing-aware regret penalty.",
     ]
     AUDIT_MD.write_text("\n".join(audit_lines), encoding="utf-8")
     print(f"Report saved to {OUTPUT_DOC}")

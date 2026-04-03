@@ -30,7 +30,12 @@ DEVICE = "cpu"
 N_CALIB = 10
 FEAT_DIM = 49
 
-OUTPUT_DIR = PROJECT_ROOT / "results" / "dynamic_metagate_gnnplus"
+OUTPUT_DIR = Path(
+    os.environ.get(
+        "METAGATE_GNNPLUS_OUTPUT_DIR",
+        str(PROJECT_ROOT / "results" / "dynamic_metagate_gnnplus"),
+    )
+).resolve()
 MODEL_PATH = OUTPUT_DIR / "models" / "metagate_gnnplus_unified.pt"
 FAILURE_RESULTS_CSV = OUTPUT_DIR / "metagate_failure_results.csv"
 FAILURE_SUMMARY_CSV = OUTPUT_DIR / "metagate_failure_summary.csv"
