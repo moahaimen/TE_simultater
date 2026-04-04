@@ -21,3 +21,13 @@ results/*
 .DS_Store
 .vscode/
 .idea/
+results/
+data/
+__pycache__/
+*.docx
+*.zip
+results/
+data/
+__pycache__/
+*.docx
+*.zip

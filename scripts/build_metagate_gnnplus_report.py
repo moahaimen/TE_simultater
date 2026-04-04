@@ -434,7 +434,7 @@ def build_report():
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run("MLP Meta-Gate with Soft Labels, Regret Loss, and Few-Shot Bayesian Calibration")
+    run = title.add_run("MLP Meta-Gate with Soft Labels, Regret Loss, and Stable Failure Features")
     run.bold = True
     run.font.size = Pt(20)
     run.font.color.rgb = RGBColor(0x1A, 0x3C, 0x6E)
@@ -450,7 +450,7 @@ def build_report():
     run = subtitle2.add_run(
         "Architecture: 4-Expert Selection via MLP Gate with Per-Topology Bayesian Calibration\n"
         "Expert pool: Bottleneck, TopK, Sensitivity, GNN+\n"
-        "Training upgrade: soft labels from expert MLUs + routing-aware regret penalty"
+        "Training upgrade: soft labels from expert MLUs + routing-aware regret penalty + clipped stable failure features"
     )
     run.font.size = Pt(11)
     run.italic = True
@@ -474,6 +474,12 @@ def build_report():
         "distribution derived from the relative MLU regret of all 4 experts. A routing-aware regret term "
         "is added to the loss so the gate is penalized much more for assigning probability to catastrophic "
         "experts than for being torn between two nearly identical good experts."
+    )
+    doc.add_paragraph(
+        "A second stability fix is applied before the MLP: the GNN correction feature is compressed with a "
+        "signed log transform, the ECMP utilization features are log-compressed, and the standardized input "
+        "vector is clipped. This prevents failure scenarios from generating numerically extreme logits that "
+        "collapse the gate to a single expert regardless of the calibration prior."
     )
     p = doc.add_paragraph()
     bold_run(p, "Key results: ")
@@ -581,6 +587,7 @@ def build_report():
             ["Soft-label temperature", str(training_summary["metagate_config"].get("soft_label_temperature", "N/A"))],
             ["Regret loss weight", str(training_summary["metagate_config"].get("regret_loss_weight", "N/A"))],
             ["Regret clip", str(training_summary["metagate_config"].get("regret_clip", "N/A"))],
+            ["Feature clip", str(training_summary["metagate_config"].get("feature_clip", "N/A"))],
             ["Train accuracy", f"{float(training_summary['train_accuracy']) * 100.0:.1f}%"],
             ["Validation accuracy", f"{float(training_summary['val_accuracy']) * 100.0:.1f}%"],
             ["GNN+ checkpoint", training_summary["gnnplus_checkpoint"]],
@@ -600,6 +607,12 @@ def build_report():
     doc.add_paragraph(
         "2) Routing-aware regret loss: the training loss now adds a penalty proportional to the expected MLU "
         "regret, so the gate learns that close misses are acceptable but high-regret experts should be suppressed.",
+        style="List Number",
+    )
+    doc.add_paragraph(
+        "3) Failure-feature stabilization: log compression is applied to unstable utilization diagnostics and "
+        "the standardized feature vector is clipped before the MLP, preventing out-of-distribution failures "
+        "from numerically saturating the classifier.",
         style="List Number",
     )
     if compare_summary is not None and compare_training is not None:
@@ -787,6 +800,11 @@ def build_report():
             "chooser under the failure scenarios themselves. For each failed timestep, the gate predicts an "
             "expert, and the report logs whether that chosen expert changes relative to normal conditions."
         )
+        doc.add_paragraph(
+            "Important reading note: Accuracy here is strict exact-oracle expert accuracy. Therefore, a row can "
+            "show BN%=100%, GNN+%=0%, and Accuracy=100.0% at the same time, because MetaGate chose Bottleneck "
+            "on every failure timestep and Bottleneck was also the oracle expert on every failure timestep."
+        )
         scenario_rows = []
         normal_dominant = {
             topo: results[results["topology"] == topo]["metagate_selector"].value_counts().idxmax()
@@ -821,6 +839,56 @@ def build_report():
                 f"{changed}/{compared}",
             ])
         add_table(doc, ["Scenario", "Accuracy", "Oracle Gap", "BN%", "TopK%", "Sens%", "GNN+%", "Changed Topologies"], scenario_rows)
+        if compare_summary is not None and COMPARE_DIR != OUTPUT_DIR and (COMPARE_DIR / "metagate_failure_results.csv").exists():
+            try:
+                prev_failure_results = pd.read_csv(COMPARE_DIR / "metagate_failure_results.csv")
+                if "dataset" in prev_failure_results.columns:
+                    prev_failure_results["topology"] = prev_failure_results["dataset"].map(canon)
+                compare_rows = []
+                for scenario in FAILURE_SCENARIO_ORDER[:3]:
+                    old_sub = prev_failure_results[prev_failure_results["scenario"] == scenario]
+                    new_sub = failure_results[failure_results["scenario"] == scenario]
+                    if old_sub.empty or new_sub.empty:
+                        continue
+                    old_counts = old_sub["metagate_selector"].value_counts()
+                    new_counts = new_sub["metagate_selector"].value_counts()
+                    old_total = max(len(old_sub), 1)
+                    new_total = max(len(new_sub), 1)
+                    old_gap = ((old_sub["metagate_mlu"].mean() - old_sub["oracle_mlu"].mean()) / old_sub["oracle_mlu"].mean()) * 100.0
+                    new_gap = ((new_sub["metagate_mlu"].mean() - new_sub["oracle_mlu"].mean()) / new_sub["oracle_mlu"].mean()) * 100.0
+                    compare_rows.append([
+                        scenario_label(scenario),
+                        f"{old_sub['correct'].mean() * 100.0:.1f}%",
+                        fmt_pct(old_gap),
+                        f"{100.0 * old_counts.get('bottleneck', 0) / old_total:.0f}%",
+                        f"{100.0 * old_counts.get('gnnplus', 0) / old_total:.0f}%",
+                        f"{new_sub['correct'].mean() * 100.0:.1f}%",
+                        fmt_pct(new_gap),
+                        f"{100.0 * new_counts.get('bottleneck', 0) / new_total:.0f}%",
+                        f"{100.0 * new_counts.get('gnnplus', 0) / new_total:.0f}%",
+                    ])
+                if compare_rows:
+                    doc.add_paragraph(
+                        "The next table makes the hard-failure fix explicit by comparing the previous soft-label/regret bundle "
+                        "with the current stabilized-failure bundle on the three link-failure scenarios."
+                    )
+                    add_table(
+                        doc,
+                        [
+                            "Scenario",
+                            "Old Acc",
+                            "Old Gap",
+                            "Old BN%",
+                            "Old GNN+%",
+                            "New Acc",
+                            "New Gap",
+                            "New BN%",
+                            "New GNN+%",
+                        ],
+                        compare_rows,
+                    )
+            except Exception:
+                pass
         collapsed = []
         for scenario in FAILURE_SCENARIO_ORDER:
             sub = failure_results[failure_results["scenario"] == scenario]
@@ -843,6 +911,9 @@ def build_report():
             if sub.empty:
                 continue
             doc.add_heading(f"7.{idx} {scenario_label(scenario)}", level=2)
+            doc.add_paragraph(
+                f"Per-topology strict accuracy, dominant expert, expert mix, and oracle gap for {scenario_label(scenario)}."
+            )
             rows = []
             for topo in TOPOLOGY_ORDER:
                 topo_sub = sub[sub["topology"] == topo]
@@ -954,7 +1025,7 @@ def build_report():
         "- Selector percentages and accuracy values come from the new integrated MetaGate+GNN+ evaluation.",
         f"- Failure section included: {'yes' if not failure_results.empty else 'no'}",
         f"- Compared against previous bundle: `{COMPARE_DIR.relative_to(PROJECT_ROOT)}`" if COMPARE_DIR != OUTPUT_DIR else "- Compared against previous bundle: no",
-        "- Training upgrade documented: soft labels from expert MLUs and routing-aware regret penalty.",
+        "- Training upgrade documented: soft labels from expert MLUs, routing-aware regret penalty, and stabilized failure features.",
     ]
     AUDIT_MD.write_text("\n".join(audit_lines), encoding="utf-8")
     print(f"Report saved to {OUTPUT_DOC}")

@@ -849,6 +849,7 @@ def main():
             "soft_label_temperature": float(config.soft_label_temperature),
             "regret_loss_weight": float(config.regret_loss_weight),
             "regret_clip": float(config.regret_clip),
+            "feature_clip": float(config.feature_clip),
         },
         "pooled_train_samples": int(len(pooled_train_X)),
         "pooled_val_samples": int(len(pooled_val_X) if pooled_val_X is not None else 0),

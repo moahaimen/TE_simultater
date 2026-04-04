@@ -47,6 +47,7 @@ class MetaGateConfig:
     soft_label_temperature: float = 0.05
     regret_loss_weight: float = 0.0
     regret_clip: float = 10.0
+    feature_clip: float = 10.0
 
 
 @dataclass
@@ -83,6 +84,10 @@ def extract_features(
       ECMP baseline (2): ecmp_max_util, ecmp_mean_util
     Total: 49 dims
     """
+    def signed_log1p(value: float) -> float:
+        value = float(value)
+        return float(np.sign(value) * np.log1p(abs(value)))
+
     tm = np.maximum(tm_vector, 0.0)
     total = float(np.sum(tm))
     nonzero = tm[tm > 0]
@@ -161,7 +166,7 @@ def extract_features(
         gnn_diag = [
             float(gnn_info.get("alpha", 0.0)),
             float(gnn_info.get("confidence", 0.0)),
-            float(gnn_info.get("gnn_correction_mean", 0.0)),
+            signed_log1p(gnn_info.get("gnn_correction_mean", 0.0)),
             float(gnn_info.get("w_bottleneck", 0.5)),
             float(gnn_info.get("w_sensitivity", 0.5)),
         ]
@@ -180,7 +185,10 @@ def extract_features(
 
     # --- ECMP baseline utilization (2) ---
     if ecmp_link_utils is not None:
-        ecmp_feats = [float(np.max(ecmp_link_utils)), float(np.mean(ecmp_link_utils))]
+        ecmp_feats = [
+            float(np.log1p(max(float(np.max(ecmp_link_utils)), 0.0))),
+            float(np.log1p(max(float(np.mean(ecmp_link_utils)), 0.0))),
+        ]
     else:
         ecmp_feats = [0.0, 0.0]
 
@@ -203,6 +211,13 @@ class DynamicMetaGate:
         self.scaler_mean = None
         self.scaler_std = None
         self._is_trained = False
+
+    def _normalize_features(self, features: np.ndarray) -> np.ndarray:
+        X = (np.asarray(features, dtype=np.float32) - self.scaler_mean) / self.scaler_std
+        clip = float(getattr(self.config, "feature_clip", 0.0) or 0.0)
+        if clip > 0.0:
+            X = np.clip(X, -clip, clip)
+        return X
 
     def train(
         self,
@@ -235,7 +250,7 @@ class DynamicMetaGate:
 
         self.scaler_mean = features.mean(axis=0)
         self.scaler_std = features.std(axis=0) + 1e-8
-        X = (features - self.scaler_mean) / self.scaler_std
+        X = self._normalize_features(features)
         y = labels.astype(np.int64)
 
         feat_dim = X.shape[1]
@@ -322,7 +337,7 @@ class DynamicMetaGate:
 
     def _eval_accuracy(self, features, labels):
         import torch
-        X = (features - self.scaler_mean) / self.scaler_std
+        X = self._normalize_features(features)
         X_t = torch.tensor(X, dtype=torch.float32)
         with torch.no_grad():
             logits = self.model(X_t)
@@ -363,7 +378,7 @@ class DynamicMetaGate:
         if not self._is_trained:
             return 0, np.array([1.0, 0.0, 0.0, 0.0])
 
-        X = (features - self.scaler_mean) / self.scaler_std
+        X = self._normalize_features(features)
         X_t = torch.tensor(X.reshape(1, -1), dtype=torch.float32)
         with torch.no_grad():
             logits = self.model(X_t)
@@ -394,6 +409,7 @@ class DynamicMetaGate:
                 "soft_label_temperature": self.config.soft_label_temperature,
                 "regret_loss_weight": self.config.regret_loss_weight,
                 "regret_clip": self.config.regret_clip,
+                "feature_clip": self.config.feature_clip,
             },
             "selector_names": SELECTOR_NAMES,
             "num_selectors": NUM_SELECTORS,
@@ -412,6 +428,7 @@ class DynamicMetaGate:
         h = payload["config"]["hidden_dim"]
         n_sel = payload.get("num_selectors", NUM_SELECTORS)
         dr = payload["config"]["dropout"]
+        self.config.feature_clip = float(payload["config"].get("feature_clip", getattr(self.config, "feature_clip", 10.0)))
         self.model = nn.Sequential(
             nn.Linear(feat_dim, h),
             nn.BatchNorm1d(h),
