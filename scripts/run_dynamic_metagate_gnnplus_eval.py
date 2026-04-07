@@ -52,11 +52,13 @@ N_CALIB = 10
 SOFT_LABEL_TEMPERATURE = 0.05
 REGRET_LOSS_WEIGHT = 0.25
 REGRET_CLIP = 10.0
+DISABLE_CALIBRATION = os.environ.get("METAGATE_GNNPLUS_DISABLE_CALIBRATION", "0") == "1"
 
 OUTPUT_DIR = Path(os.environ.get("METAGATE_GNNPLUS_OUTPUT_DIR", "results/dynamic_metagate_gnnplus"))
 MODEL_DIR = OUTPUT_DIR / "models"
 GNNPLUS_CHECKPOINT = Path("results/gnn_plus_retrained_fixedk40/gnn_plus_fixed_k40.pt")
 GNNPLUS_SOURCE_CHECKPOINT = Path("results/gnn_plus/stage1_regularization/training_d02/final.pt")
+SDN_METRICS_CSV = OUTPUT_DIR / "metagate_sdn_metrics.csv"
 
 SELECTOR_NAMES = ["bottleneck", "topk", "sensitivity", "gnnplus"]
 NUM_SELECTORS = len(SELECTOR_NAMES)
@@ -78,8 +80,15 @@ def setup():
         select_sensitivity_critical,
         select_topk_by_demand,
     )
+    from te.disturbance import compute_disturbance
     from te.lp_solver import solve_selected_path_lp
     from te.simulator import apply_routing
+    from sdn.openflow_adapter import (
+        SDNTopologyMapping,
+        build_ecmp_baseline_rules,
+        compute_rule_diff,
+        splits_to_openflow_rules,
+    )
     from phase1_reactive.eval.common import (
         load_bundle,
         load_named_dataset,
@@ -103,8 +112,13 @@ def setup():
         "select_bottleneck_critical": select_bottleneck_critical,
         "select_sensitivity_critical": select_sensitivity_critical,
         "select_topk_by_demand": select_topk_by_demand,
+        "compute_disturbance": compute_disturbance,
         "solve_selected_path_lp": solve_selected_path_lp,
         "apply_routing": apply_routing,
+        "SDNTopologyMapping": SDNTopologyMapping,
+        "build_ecmp_baseline_rules": build_ecmp_baseline_rules,
+        "compute_rule_diff": compute_rule_diff,
+        "splits_to_openflow_rules": splits_to_openflow_rules,
         "load_bundle": load_bundle,
         "load_named_dataset": load_named_dataset,
         "collect_specs": collect_specs,
@@ -358,6 +372,11 @@ def evaluate_on_topology(M, dataset, path_library, gate, gnnplus_model, k_crit, 
     oracle_by_ts = oracle_df.set_index("timestep") if not oracle_df.empty else pd.DataFrame()
     results = []
     decisions = []
+    topo_mapping = M["SDNTopologyMapping"].from_mininet(dataset.nodes, dataset.edges, dataset.od_pairs)
+    baseline_groups, _ = M["build_ecmp_baseline_rules"](path_library, topo_mapping, dataset.edges)
+    current_groups = baseline_groups
+    current_splits = [np.asarray(s, dtype=float).copy() for s in ecmp_base]
+    prev_latency_by_od = None
 
     for t_idx in test_indices:
         tm = np.asarray(dataset.tm[t_idx], dtype=float)
@@ -416,6 +435,29 @@ def evaluate_on_topology(M, dataset, path_library, gate, gnnplus_model, k_crit, 
         )
         routing = M["apply_routing"](tm, lp.splits, path_library, capacities)
         t_lp_ms = (time.perf_counter() - t_lp_start) * 1000
+        selected_splits = [np.asarray(s, dtype=float).copy() for s in lp.splits]
+
+        t_rule_start = time.perf_counter()
+        new_groups, _ = M["splits_to_openflow_rules"](
+            selected_splits,
+            selected_ods,
+            path_library,
+            topo_mapping,
+            dataset.edges,
+        )
+        changed_groups = M["compute_rule_diff"](current_groups, new_groups)
+        flow_table_updates = int(len(changed_groups))
+        rule_install_delay_ms = (time.perf_counter() - t_rule_start) * 1000
+
+        disturbance = float(M["compute_disturbance"](current_splits, selected_splits, tm))
+        telemetry_selected = M["compute_reactive_telemetry"](
+            tm,
+            selected_splits,
+            path_library,
+            routing,
+            weights,
+            prev_latency_by_od=prev_latency_by_od,
+        )
 
         t_total_ms = (time.perf_counter() - t_total_start) * 1000
         metagate_mlu = float(routing.mlu)
@@ -449,6 +491,14 @@ def evaluate_on_topology(M, dataset, path_library, gate, gnnplus_model, k_crit, 
                 "sens_mlu": sens_mlu,
                 "gnnplus_mlu": gnnplus_mlu,
                 "correct": 1 if pred_name == oracle_selector else 0,
+                "throughput": float(telemetry_selected.throughput),
+                "mean_latency": float(telemetry_selected.mean_latency),
+                "p95_latency": float(telemetry_selected.p95_latency),
+                "packet_loss": float(telemetry_selected.packet_loss),
+                "jitter": float(telemetry_selected.jitter),
+                "disturbance": disturbance,
+                "flow_table_updates": flow_table_updates,
+                "rule_install_delay_ms": float(rule_install_delay_ms),
                 "t_bn_ms": expert_timing["bottleneck"],
                 "t_topk_ms": expert_timing["topk"],
                 "t_sens_ms": expert_timing["sensitivity"],
@@ -474,6 +524,9 @@ def evaluate_on_topology(M, dataset, path_library, gate, gnnplus_model, k_crit, 
                 "prob_gnnplus": float(probs[3]),
             }
         )
+        current_splits = selected_splits
+        current_groups = new_groups
+        prev_latency_by_od = np.asarray(telemetry_selected.latency_by_od, dtype=float)
 
     return results, decisions
 
@@ -641,7 +694,10 @@ def main():
     print(f"  Model saved to {MODEL_DIR / 'metagate_gnnplus_unified.pt'}")
 
     print("\n" + "=" * 72)
-    print(f"  PHASE 3: Calibration ({N_CALIB} val TMs) + Evaluation on ALL 8 topologies")
+    if DISABLE_CALIBRATION:
+        print("  PHASE 3: PURE ZERO-SHOT EVALUATION ON ALL 8 TOPOLOGIES")
+    else:
+        print(f"  PHASE 3: Calibration ({N_CALIB} val TMs) + Evaluation on ALL 8 topologies")
     print("=" * 72)
 
     all_results = []
@@ -654,52 +710,66 @@ def main():
         topo_type = "UNSEEN" if ds_key in UNSEEN_TOPOLOGIES else "known"
         print(f"\n  [{topo_type}] {ds_key}...")
 
-        val_indices = M["split_indices"](dataset, "val")
-        calib_indices = val_indices[:N_CALIB]
-        print(f"    Calibrating on {len(calib_indices)} val TMs...")
-        try:
-            _, calib_labels, _, _, _, _ = compute_features_and_oracle_for_topology(
-                M,
-                dataset,
-                pl,
-                calib_indices,
-                gnnplus_model,
-                K_CRIT,
-            )
-            if len(calib_labels) > 0:
-                win_counts = np.bincount(calib_labels, minlength=NUM_SELECTORS)
-                gate.calibrate(win_counts, smoothing=1.0, strength=5.0)
-                prior = gate._calibration_prior
-                calibration_rows.append(
-                    {
-                        "dataset": ds_key,
-                        "topology_type": "unseen" if ds_key in UNSEEN_TOPOLOGIES else "known",
-                        "bottleneck_prior": float(prior[0]),
-                        "topk_prior": float(prior[1]),
-                        "sensitivity_prior": float(prior[2]),
-                        "gnnplus_prior": float(prior[3]),
-                    }
-                )
-                print(
-                    f"    Calibration prior: BN={prior[0]:.2f} TopK={prior[1]:.2f} "
-                    f"Sens={prior[2]:.2f} GNN+={prior[3]:.2f}"
-                )
-            else:
-                gate.clear_calibration()
-                calibration_rows.append(
-                    {
-                        "dataset": ds_key,
-                        "topology_type": "unseen" if ds_key in UNSEEN_TOPOLOGIES else "known",
-                        "bottleneck_prior": np.nan,
-                        "topk_prior": np.nan,
-                        "sensitivity_prior": np.nan,
-                        "gnnplus_prior": np.nan,
-                    }
-                )
-                print("    No valid calibration TMs, using raw MLP predictions")
-        except Exception as e:
-            print(f"    Calibration failed: {e}, using raw MLP predictions")
+        if DISABLE_CALIBRATION:
             gate.clear_calibration()
+            calibration_rows.append(
+                {
+                    "dataset": ds_key,
+                    "topology_type": "unseen" if ds_key in UNSEEN_TOPOLOGIES else "known",
+                    "bottleneck_prior": np.nan,
+                    "topk_prior": np.nan,
+                    "sensitivity_prior": np.nan,
+                    "gnnplus_prior": np.nan,
+                }
+            )
+            print("    Pure zero-shot mode: calibration disabled")
+        else:
+            val_indices = M["split_indices"](dataset, "val")
+            calib_indices = val_indices[:N_CALIB]
+            print(f"    Calibrating on {len(calib_indices)} val TMs...")
+            try:
+                _, calib_labels, _, _, _, _ = compute_features_and_oracle_for_topology(
+                    M,
+                    dataset,
+                    pl,
+                    calib_indices,
+                    gnnplus_model,
+                    K_CRIT,
+                )
+                if len(calib_labels) > 0:
+                    win_counts = np.bincount(calib_labels, minlength=NUM_SELECTORS)
+                    gate.calibrate(win_counts, smoothing=1.0, strength=5.0)
+                    prior = gate._calibration_prior
+                    calibration_rows.append(
+                        {
+                            "dataset": ds_key,
+                            "topology_type": "unseen" if ds_key in UNSEEN_TOPOLOGIES else "known",
+                            "bottleneck_prior": float(prior[0]),
+                            "topk_prior": float(prior[1]),
+                            "sensitivity_prior": float(prior[2]),
+                            "gnnplus_prior": float(prior[3]),
+                        }
+                    )
+                    print(
+                        f"    Calibration prior: BN={prior[0]:.2f} TopK={prior[1]:.2f} "
+                        f"Sens={prior[2]:.2f} GNN+={prior[3]:.2f}"
+                    )
+                else:
+                    gate.clear_calibration()
+                    calibration_rows.append(
+                        {
+                            "dataset": ds_key,
+                            "topology_type": "unseen" if ds_key in UNSEEN_TOPOLOGIES else "known",
+                            "bottleneck_prior": np.nan,
+                            "topk_prior": np.nan,
+                            "sensitivity_prior": np.nan,
+                            "gnnplus_prior": np.nan,
+                        }
+                    )
+                    print("    No valid calibration TMs, using raw MLP predictions")
+            except Exception as e:
+                print(f"    Calibration failed: {e}, using raw MLP predictions")
+                gate.clear_calibration()
 
         test_indices = M["split_indices"](dataset, "test")
         print(f"    Computing test oracle for {len(test_indices)} TMs...")
@@ -792,6 +862,14 @@ def main():
             t_decision_ms=("t_decision_ms", "mean"),
             t_lp_ms=("t_lp_ms", "mean"),
             t_total_ms=("t_total_ms", "mean"),
+            throughput=("throughput", "mean"),
+            mean_latency=("mean_latency", "mean"),
+            p95_latency=("p95_latency", "mean"),
+            packet_loss=("packet_loss", "mean"),
+            jitter=("jitter", "mean"),
+            mean_disturbance=("disturbance", "mean"),
+            flow_table_updates=("flow_table_updates", "mean"),
+            rule_install_delay_ms=("rule_install_delay_ms", "mean"),
             n_timesteps=("timestep", "count"),
         )
         .reset_index()
@@ -818,6 +896,36 @@ def main():
         .reset_index()
     )
     timing_summary.to_csv(OUTPUT_DIR / "metagate_timing.csv", index=False)
+
+    sdn_metrics = (
+        summary[[
+            "dataset",
+            "topology_type",
+            "metagate_mlu",
+            "throughput",
+            "mean_disturbance",
+            "mean_latency",
+            "p95_latency",
+            "packet_loss",
+            "jitter",
+            "t_decision_ms",
+            "flow_table_updates",
+            "rule_install_delay_ms",
+        ]]
+        .rename(
+            columns={
+                "dataset": "topology",
+                "topology_type": "status",
+                "metagate_mlu": "mean_mlu",
+                "mean_latency": "mean_latency_au",
+                "p95_latency": "p95_latency_au",
+                "jitter": "jitter_au",
+                "t_decision_ms": "decision_time_ms",
+            }
+        )
+    )
+    sdn_metrics["status"] = sdn_metrics["status"].str.lower()
+    sdn_metrics.to_csv(SDN_METRICS_CSV, index=False)
 
     total_acc = float(results_df["correct"].mean())
     known_acc = float(results_df[results_df["topology_type"] == "known"]["correct"].mean())
@@ -859,7 +967,8 @@ def main():
         "overall_test_accuracy": total_acc,
         "known_test_accuracy": known_acc,
         "unseen_test_accuracy": unseen_acc,
-        "calibration_size": int(N_CALIB),
+            "calibration_size": int(N_CALIB),
+            "disable_calibration": bool(DISABLE_CALIBRATION),
     }
     (OUTPUT_DIR / "training_summary.json").write_text(json.dumps(training_summary, indent=2), encoding="utf-8")
 

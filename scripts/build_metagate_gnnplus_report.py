@@ -46,6 +46,9 @@ COMPARE_DIR = Path(
         str(PROJECT_ROOT / "results" / "dynamic_metagate_gnnplus"),
     )
 ).resolve()
+INCLUDE_FAILURE_FIX_NOTE = os.environ.get("METAGATE_GNNPLUS_INCLUDE_FAILURE_FIX_NOTE", "1") != "0"
+INCLUDE_FAILURE_COMPARE_TABLE = os.environ.get("METAGATE_GNNPLUS_INCLUDE_FAILURE_COMPARE_TABLE", "1") != "0"
+ZERO_SHOT_ONLY = os.environ.get("METAGATE_GNNPLUS_ZERO_SHOT_ONLY", "0") == "1"
 
 RESULTS_CSV = OUTPUT_DIR / "metagate_results.csv"
 DECISIONS_CSV = OUTPUT_DIR / "metagate_decisions.csv"
@@ -62,6 +65,12 @@ ZERO_SHOT_UNSEEN_SUMMARY_CSV = OUTPUT_DIR / "zero_shot_unseen_summary.csv"
 COMPARE_SUMMARY_CSV = COMPARE_DIR / "metagate_summary.csv"
 COMPARE_RESULTS_CSV = COMPARE_DIR / "metagate_results.csv"
 COMPARE_TRAINING_SUMMARY_JSON = COMPARE_DIR / "training_summary.json"
+PACKET_SDN_DIR = PROJECT_ROOT / "results" / "gnnplus_packet_sdn_report_fixed"
+PACKET_SDN_SUMMARY_CSV = PACKET_SDN_DIR / "packet_sdn_summary.csv"
+PACKET_SDN_FAILURE_CSV = PACKET_SDN_DIR / "packet_sdn_failure.csv"
+PACKET_SDN_METRICS_CSV = PACKET_SDN_DIR / "packet_sdn_sdn_metrics.csv"
+PACKET_SDN_PLOTS_DIR = PACKET_SDN_DIR / "plots"
+COMPANION_SDN_SUMMARY_CSV = OUTPUT_DIR / "companion_packet_sdn_metrics_summary.csv"
 
 TOPOLOGY_ORDER = [
     "abilene",
@@ -226,6 +235,178 @@ def add_image(doc: Document, path: Path, caption: str, width: float = 6.0):
     run.italic = True
     run.font.size = Pt(9)
     run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+
+
+def render_table_value(value) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        if pd.isna(value):
+            return "N/A"
+    except Exception:
+        pass
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        return fmt(value)
+    return str(value)
+
+
+def add_dataframe_table(doc: Document, df: pd.DataFrame, title: str | None = None, font_size: int = 9):
+    if title:
+        doc.add_paragraph(title)
+    rows = [[render_table_value(v) for v in row] for row in df.itertuples(index=False, name=None)]
+    add_table(doc, list(df.columns), rows, font_size=font_size)
+
+
+def add_dataframe_chunks(doc: Document, df: pd.DataFrame, heading_prefix: str, chunk_size: int = 20, font_size: int = 8):
+    if df.empty:
+        return
+    for idx in range(0, len(df), chunk_size):
+        chunk = df.iloc[idx : idx + chunk_size].reset_index(drop=True)
+        suffix = "" if idx == 0 else f" (cont. {idx // chunk_size + 1})"
+        add_dataframe_table(doc, chunk, title=f"{heading_prefix}{suffix}", font_size=font_size)
+
+
+def load_companion_packet_sdn_inputs():
+    if not PACKET_SDN_SUMMARY_CSV.exists() or not PACKET_SDN_METRICS_CSV.exists():
+        return None, None, None
+    summary = pd.read_csv(PACKET_SDN_SUMMARY_CSV)
+    metrics = pd.read_csv(PACKET_SDN_METRICS_CSV)
+    failure = pd.read_csv(PACKET_SDN_FAILURE_CSV) if PACKET_SDN_FAILURE_CSV.exists() else pd.DataFrame()
+    return summary, metrics, failure
+
+
+def build_complexity_rows() -> pd.DataFrame:
+    rows = [
+        {
+            "Component": "Bottleneck",
+            "Online stage": "Critical-flow heuristic plus LP on selected flows",
+            "Complexity": "Heuristic proposal generation plus one LP solve when selected",
+            "Practical note": "Robust fallback under hard failures; LP dominates controller cost when chosen.",
+        },
+        {
+            "Component": "TopK",
+            "Online stage": "Sort OD demands and select top-K flows",
+            "Complexity": "Cheap ranking-based proposal generation",
+            "Practical note": "Low proposal cost; no learned inference.",
+        },
+        {
+            "Component": "Sensitivity",
+            "Online stage": "Impact scoring over candidate OD pairs",
+            "Complexity": "Heuristic scoring pass plus LP when selected",
+            "Practical note": "More expensive than TopK, but still lighter than GNN+ inference.",
+        },
+        {
+            "Component": "GNN+",
+            "Online stage": "Graph-neural proposal generation for K=40 flows",
+            "Complexity": "Learned inference with richer feature construction",
+            "Practical note": "Highest single-expert proposal cost in this bundle.",
+        },
+        {
+            "Component": "MetaGate+GNN+",
+            "Online stage": "Run all 4 proposal generators, extract 49 features, apply MLP gate, then solve one LP",
+            "Complexity": "Sum of expert proposal costs plus small MLP plus one LP",
+            "Practical note": "At runtime, the gate pays proposal-generation cost for all experts, but only one LP reroute is executed.",
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
+def build_complexity_numeric_rows(timing: pd.DataFrame) -> pd.DataFrame:
+    component_map = {
+        "Bottleneck proposal": "t_bn_ms",
+        "TopK proposal": "t_topk_ms",
+        "Sensitivity proposal": "t_sens_ms",
+        "GNN+ proposal": "t_gnnplus_ms",
+        "Feature extraction": "t_features_ms",
+        "MLP gate": "t_mlp_ms",
+        "LP reroute": "t_lp_ms",
+        "Selector overhead": "t_decision_ms",
+        "End-to-end total": "t_total_ms",
+    }
+    rows = []
+    for label, col in component_map.items():
+        series = pd.to_numeric(timing[col], errors="coerce")
+        rows.append(
+            {
+                "Component": label,
+                "Mean (ms)": float(series.mean()),
+                "Median (ms)": float(series.median()),
+                "Max (ms)": float(series.max()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_sdn_metrics_formula_rows() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"Component": "Per-link delay", "Model": "M/M/1 queueing", "Formula / rule": "d = 1 / (mu - lambda) + prop_delay"},
+            {"Component": "End-to-end delay", "Model": "Path sum", "Formula / rule": "sum of per-link delays"},
+            {"Component": "Throughput", "Model": "Bottleneck model", "Formula / rule": "minimum capacity / load ratio along routed paths"},
+            {"Component": "Packet loss", "Model": "Overflow approximation", "Formula / rule": "max(0, (load - capacity) / load)"},
+            {"Component": "Jitter", "Model": "Delay variation", "Formula / rule": "|delay(t) - delay(t-1)|"},
+            {"Component": "Rule install delay", "Model": "Analytical SDN control cost", "Formula / rule": "0.5 ms + 0.02 ms * num_rules"},
+            {"Component": "Failure recovery", "Model": "Controller reroute time", "Formula / rule": "cycles / wall-clock from failure to reroute"},
+        ]
+    )
+
+
+def build_packet_sdn_companion_summary(summary_df: pd.DataFrame, metrics_df: pd.DataFrame) -> pd.DataFrame:
+    packet_df = summary_df.copy()
+    method_map = {
+        "ecmp": "ECMP",
+        "bottleneck": "Bottleneck",
+        "gnn": "GNN",
+        "gnnplus": "GNN+",
+        "ECMP": "ECMP",
+        "BOTTLENECK": "Bottleneck",
+        "GNN": "GNN",
+        "GNNPLUS": "GNN+",
+    }
+    packet_df["Method"] = packet_df["method"].map(method_map)
+    grouped = (
+        packet_df.groupby("Method", as_index=False)
+        .agg(
+            {
+                "mean_mlu": "mean",
+                "throughput": "mean",
+                "mean_disturbance": "mean",
+                "mean_latency_au": "mean",
+                "packet_loss": "mean",
+                "jitter_au": "mean",
+                "decision_time_ms": "mean",
+                "rule_install_delay_ms": "mean",
+                "flow_table_updates": "mean",
+            }
+        )
+        .rename(
+            columns={
+                "mean_mlu": "Avg MLU",
+                "throughput": "Avg Throughput",
+                "mean_disturbance": "Avg Disturbance",
+                "mean_latency_au": "Avg Delay (au)",
+                "packet_loss": "Avg Packet Loss",
+                "jitter_au": "Avg Jitter",
+                "decision_time_ms": "Avg Decision Time (ms)",
+                "rule_install_delay_ms": "Avg Rule Install Delay (ms)",
+                "flow_table_updates": "Avg Flow Table Updates",
+            }
+        )
+    )
+    metrics_df = metrics_df.copy()
+    metrics_df["Method"] = metrics_df["Method"].map(method_map)
+    recovery = (
+        metrics_df.groupby("Method", as_index=False)["Recovery Time (ms)"]
+        .mean()
+        .rename(columns={"Recovery Time (ms)": "Avg Recovery Time (ms)"})
+    )
+    grouped = grouped.merge(recovery, on="Method", how="left")
+    method_order = {"ECMP": 0, "Bottleneck": 1, "GNN": 2, "GNN+": 3}
+    grouped["__order"] = grouped["Method"].map(method_order)
+    grouped = grouped.sort_values("__order").drop(columns="__order").reset_index(drop=True)
+    return grouped
 
 
 def load_inputs():
@@ -407,6 +588,7 @@ def plot_before_after_accuracy(compare_summary: pd.DataFrame, summary: pd.DataFr
 def build_report():
     results, decisions, summary, timing, calib, train_dist, oracle, training_summary, failure_results, failure_summary, failure_calib, zero_shot_unseen = load_inputs()
     compare_summary, compare_results, compare_training = load_compare_inputs()
+    packet_sdn_summary, packet_sdn_metrics, packet_sdn_failure = load_companion_packet_sdn_inputs()
 
     summary = summary.set_index("topology").reindex(TOPOLOGY_ORDER).reset_index()
     timing = timing.set_index("topology").reindex(TOPOLOGY_ORDER).reset_index()
@@ -434,23 +616,39 @@ def build_report():
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run("MLP Meta-Gate with Soft Labels, Regret Loss, and Stable Failure Features")
+    title_text = (
+        "MLP Meta-Gate with Soft Labels, Regret Loss, and Pure Zero-Shot Generalization"
+        if ZERO_SHOT_ONLY
+        else "MLP Meta-Gate with Soft Labels, Regret Loss, and Stable Failure Features"
+    )
+    run = title.add_run(title_text)
     run.bold = True
     run.font.size = Pt(20)
     run.font.color.rgb = RGBColor(0x1A, 0x3C, 0x6E)
 
     subtitle = doc.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = subtitle.add_run("Final Evaluation Report (GNN+ Expert Version, Improved Training)")
+    subtitle_text = (
+        "Final Evaluation Report (GNN+ Expert Version, Pure Zero-Shot)"
+        if ZERO_SHOT_ONLY
+        else "Final Evaluation Report (GNN+ Expert Version, Improved Training)"
+    )
+    run = subtitle.add_run(subtitle_text)
     run.font.size = Pt(14)
     run.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
 
     subtitle2 = doc.add_paragraph()
     subtitle2.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = subtitle2.add_run(
-        "Architecture: 4-Expert Selection via MLP Gate with Per-Topology Bayesian Calibration\n"
-        "Expert pool: Bottleneck, TopK, Sensitivity, GNN+\n"
-        "Training upgrade: soft labels from expert MLUs + routing-aware regret penalty + clipped stable failure features"
+        (
+            "Architecture: 4-Expert Selection via MLP Gate without Topology Calibration\n"
+            "Expert pool: Bottleneck, TopK, Sensitivity, GNN+\n"
+            "Training upgrade: soft labels from expert MLUs + routing-aware regret penalty + clipped stable failure features"
+            if ZERO_SHOT_ONLY
+            else "Architecture: 4-Expert Selection via MLP Gate with Per-Topology Bayesian Calibration\n"
+            "Expert pool: Bottleneck, TopK, Sensitivity, GNN+\n"
+            "Training upgrade: soft labels from expert MLUs + routing-aware regret penalty + clipped stable failure features"
+        )
     )
     run.font.size = Pt(11)
     run.italic = True
@@ -463,12 +661,19 @@ def build_report():
         "dropout, trained on pooled oracle labels from 6 known topologies. Germany50 and VtlWavenet2011 "
         "are held out entirely from gate-weight training."
     )
-    doc.add_paragraph(
-        "A lightweight few-shot Bayesian calibration phase adapts the gate to each target topology "
-        "at deployment time by running 10 validation traffic matrices through all 4 experts, counting "
-        "which expert achieves the lowest MLU, and fusing this topology-specific prior with the MLP "
-        "softmax output. No gradient updates occur during calibration."
-    )
+    if ZERO_SHOT_ONLY:
+        doc.add_paragraph(
+            "This report uses a pure zero-shot evaluation protocol. Germany50 and VtlWavenet2011 are held out "
+            "from gate-weight training, and the trained gate is applied directly at test time with no target-topology "
+            "calibration, no Bayesian prior fusion, and no gradient-based adaptation."
+        )
+    else:
+        doc.add_paragraph(
+            "A lightweight few-shot Bayesian calibration phase adapts the gate to each target topology "
+            "at deployment time by running 10 validation traffic matrices through all 4 experts, counting "
+            "which expert achieves the lowest MLU, and fusing this topology-specific prior with the MLP "
+            "softmax output. No gradient updates occur during calibration."
+        )
     doc.add_paragraph(
         "In the updated training pipeline, the hard one-hot oracle target is replaced with a soft target "
         "distribution derived from the relative MLU regret of all 4 experts. A routing-aware regret term "
@@ -483,12 +688,20 @@ def build_report():
     )
     p = doc.add_paragraph()
     bold_run(p, "Key results: ")
-    p.add_run(
-        f"Calibrated Germany50 (unseen): GNN+ selected {germany_gnnplus_pct:.1f}% of timesteps, "
-        f"oracle gap {((germany_summary['metagate_mlu'] - germany_summary['oracle_mlu']) / germany_summary['oracle_mlu']) * 100.0:+.2f}%, "
-        f"accuracy {germany_summary['accuracy'] * 100.0:.1f}%. Overall accuracy {overall_acc:.1f}% across 8 topologies. "
-        f"Mean selector decision overhead {mean_decision:.1f} ms; mean end-to-end time (including LP) {mean_total:.1f} ms."
-    )
+    if ZERO_SHOT_ONLY:
+        p.add_run(
+            f"Zero-shot Germany50 (unseen): GNN+ selected {germany_gnnplus_pct:.1f}% of timesteps, "
+            f"oracle gap {((germany_summary['metagate_mlu'] - germany_summary['oracle_mlu']) / germany_summary['oracle_mlu']) * 100.0:+.2f}%, "
+            f"accuracy {germany_summary['accuracy'] * 100.0:.1f}%. Overall accuracy {overall_acc:.1f}% across 8 topologies. "
+            f"Mean selector decision overhead {mean_decision:.1f} ms; mean end-to-end time (including LP) {mean_total:.1f} ms."
+        )
+    else:
+        p.add_run(
+            f"Calibrated Germany50 (unseen): GNN+ selected {germany_gnnplus_pct:.1f}% of timesteps, "
+            f"oracle gap {((germany_summary['metagate_mlu'] - germany_summary['oracle_mlu']) / germany_summary['oracle_mlu']) * 100.0:+.2f}%, "
+            f"accuracy {germany_summary['accuracy'] * 100.0:.1f}%. Overall accuracy {overall_acc:.1f}% across 8 topologies. "
+            f"Mean selector decision overhead {mean_decision:.1f} ms; mean end-to-end time (including LP) {mean_total:.1f} ms."
+        )
     if compare_training is not None:
         p = doc.add_paragraph()
         bold_run(p, "Improvement snapshot: ")
@@ -500,8 +713,8 @@ def build_report():
 
     doc.add_heading("1. Contributions", level=1)
     items = [
-        "Base objective preserved: zero-shot generalization to unseen topologies, evaluated without any target-topology calibration.",
-        "Additional contribution: lightweight few-shot Bayesian calibration before inference, used as a deployment-time enhancement rather than weight retraining.",
+        "Base objective: zero-shot generalization to unseen topologies.",
+        "Evaluation protocol: no target-topology calibration, no Bayesian prior fusion, and no weight updates at test time." if ZERO_SHOT_ONLY else "Additional contribution: lightweight few-shot Bayesian calibration before inference, used as a deployment-time enhancement rather than weight retraining.",
         "Honest MLP Meta-Gate architecture with a real 4-expert pool and per-timestep learned routing-strategy selection.",
         "GNN+ replaces the Original GNN as the learned expert inside the MetaGate evaluation itself.",
         "Unified gate training on known topologies only, with Germany50 and VtlWavenet2011 held out from gate-weight training.",
@@ -518,7 +731,7 @@ def build_report():
         "Run all 4 experts (Bottleneck, TopK, Sensitivity, GNN+) to produce 4 candidate OD-pair selections, each of size K_crit = 40.",
         "Extract a 49-dimensional feature vector from the TM, expert outputs, GNN+ diagnostics, ECMP baseline, and topology metrics.",
         "The MLP gate predicts which expert will achieve the lowest MLU.",
-        "If Bayesian calibration is active, fuse MLP softmax with topology-specific prior.",
+        "Predict the expert directly from the MLP softmax without any topology-specific prior." if ZERO_SHOT_ONLY else "If Bayesian calibration is active, fuse MLP softmax with topology-specific prior.",
         "Route the predicted expert's selection through LP optimization to obtain the final MLU.",
     ]
     for step in steps:
@@ -667,66 +880,92 @@ def build_report():
         if before_after_plot is not None:
             add_image(doc, before_after_plot, "Before vs after exact-expert accuracy after soft-label and regret-loss training.")
 
-    doc.add_heading("4. Few-Shot Bayesian Calibration", level=1)
-    doc.add_paragraph(
-        "Before evaluating on any topology, a calibration phase runs 10 validation traffic matrices "
-        "through all 4 experts with LP optimization, counting which expert achieves the lowest MLU. "
-        "This produces a topology-specific prior that is fused with the MLP softmax at inference time."
-    )
-    calib_rows = []
-    for topo in TOPOLOGY_ORDER:
-        row = calib[calib["topology"] == topo]
-        if row.empty:
-            continue
-        rec = row.iloc[0]
-        calib_rows.append([
-            TOPOLOGY_INFO[topo]["display"],
-            topo_type(topo),
-            fmt(rec["bottleneck_prior"], 2),
-            fmt(rec["topk_prior"], 2),
-            fmt(rec["sensitivity_prior"], 2),
-            fmt(rec["gnnplus_prior"], 2),
-        ])
-    add_table(doc, ["Topology", "Type", "BN Prior", "TopK Prior", "Sens Prior", "GNN+ Prior"], calib_rows)
-    doc.add_heading("4.1 Objective Framing: Zero-Shot Baseline and Few-Shot Extension", level=2)
-    doc.add_paragraph(
-        "The original project objective is zero-shot generalization to unseen topologies. To keep that objective "
-        "scientifically valid, the report distinguishes between a zero-shot baseline and a stronger deployment mode "
-        "that adds a lightweight few-shot Bayesian calibration prior before inference."
-    )
-    doc.add_paragraph(
-        "In this framing, the base MetaGate weights are always trained only on the 6 known topologies. The zero-shot "
-        "setting performs direct inference on Germany50 and VtlWavenet2011 with no target-topology adaptation. The "
-        "few-shot calibrated setting uses 10 validation traffic matrices from the target topology to estimate a prior, "
-        "but it still performs no gradient-based fine-tuning or weight updates."
-    )
-    if not zero_shot_unseen.empty:
-        comparison_rows = []
-        for topo in ["germany50", "vtlwavenet2011"]:
-            zrow = zero_shot_unseen[zero_shot_unseen["topology"] == topo]
-            crow = summary[summary["topology"] == topo]
-            if zrow.empty or crow.empty:
+    if ZERO_SHOT_ONLY:
+        doc.add_heading("4. Zero-Shot Evaluation Protocol", level=1)
+        doc.add_paragraph(
+            "The original project objective is pure zero-shot generalization to unseen topologies. In this report, "
+            "the gate is trained only on the 6 known topologies and then evaluated directly on all 8 topologies "
+            "without topology-specific calibration, Bayesian prior fusion, or test-time adaptation."
+        )
+        if not zero_shot_unseen.empty:
+            rows = []
+            for topo in ["germany50", "vtlwavenet2011"]:
+                zrow = zero_shot_unseen[zero_shot_unseen["topology"] == topo]
+                if zrow.empty:
+                    continue
+                zrec = zrow.iloc[0]
+                rows.append([
+                    TOPOLOGY_INFO[topo]["display"],
+                    f"{float(zrec['accuracy']) * 100.0:.1f}%",
+                    fmt_pct(float(zrec["oracle_gap_pct"])),
+                    str(int(zrec["n_timesteps"])),
+                ])
+            add_table(
+                doc,
+                ["Unseen Topology", "Zero-Shot Accuracy", "Zero-Shot Gap", "Test Timesteps"],
+                rows,
+            )
+    else:
+        doc.add_heading("4. Few-Shot Bayesian Calibration", level=1)
+        doc.add_paragraph(
+            "Before evaluating on any topology, a calibration phase runs 10 validation traffic matrices "
+            "through all 4 experts with LP optimization, counting which expert achieves the lowest MLU. "
+            "This produces a topology-specific prior that is fused with the MLP softmax at inference time."
+        )
+        calib_rows = []
+        for topo in TOPOLOGY_ORDER:
+            row = calib[calib["topology"] == topo]
+            if row.empty:
                 continue
-            zrec = zrow.iloc[0]
-            crec = crow.iloc[0]
-            zgap = (float(zrec["metagate_mlu"]) - float(zrec["oracle_mlu"])) / float(zrec["oracle_mlu"]) * 100.0
-            cgap = (float(crec["metagate_mlu"]) - float(crec["oracle_mlu"])) / float(crec["oracle_mlu"]) * 100.0
-            comparison_rows.append([
+            rec = row.iloc[0]
+            calib_rows.append([
                 TOPOLOGY_INFO[topo]["display"],
-                f"{float(zrec['accuracy']) * 100.0:.1f}%",
-                fmt_pct(zgap),
-                f"{float(crec['accuracy']) * 100.0:.1f}%",
-                fmt_pct(cgap),
+                topo_type(topo),
+                fmt(rec["bottleneck_prior"], 2),
+                fmt(rec["topk_prior"], 2),
+                fmt(rec["sensitivity_prior"], 2),
+                fmt(rec["gnnplus_prior"], 2),
             ])
-        add_table(
-            doc,
-            ["Unseen Topology", "Zero-Shot Accuracy", "Zero-Shot Gap", "Calibrated Accuracy", "Calibrated Gap"],
-            comparison_rows,
+        add_table(doc, ["Topology", "Type", "BN Prior", "TopK Prior", "Sens Prior", "GNN+ Prior"], calib_rows)
+        doc.add_heading("4.1 Objective Framing: Zero-Shot Baseline and Few-Shot Extension", level=2)
+        doc.add_paragraph(
+            "The original project objective is zero-shot generalization to unseen topologies. To keep that objective "
+            "scientifically valid, the report distinguishes between a zero-shot baseline and a stronger deployment mode "
+            "that adds a lightweight few-shot Bayesian calibration prior before inference."
         )
         doc.add_paragraph(
-            "This table is included so the report can keep zero-shot generalization as the base objective, while also "
-            "showing that the few-shot calibration module is an additional contribution that improves deployment on the unseen topologies."
+            "In this framing, the base MetaGate weights are always trained only on the 6 known topologies. The zero-shot "
+            "setting performs direct inference on Germany50 and VtlWavenet2011 with no target-topology adaptation. The "
+            "few-shot calibrated setting uses 10 validation traffic matrices from the target topology to estimate a prior, "
+            "but it still performs no gradient-based fine-tuning or weight updates."
         )
+        if not zero_shot_unseen.empty:
+            comparison_rows = []
+            for topo in ["germany50", "vtlwavenet2011"]:
+                zrow = zero_shot_unseen[zero_shot_unseen["topology"] == topo]
+                crow = summary[summary["topology"] == topo]
+                if zrow.empty or crow.empty:
+                    continue
+                zrec = zrow.iloc[0]
+                crec = crow.iloc[0]
+                zgap = (float(zrec["metagate_mlu"]) - float(zrec["oracle_mlu"])) / float(zrec["oracle_mlu"]) * 100.0
+                cgap = (float(crec["metagate_mlu"]) - float(crec["oracle_mlu"])) / float(crec["oracle_mlu"]) * 100.0
+                comparison_rows.append([
+                    TOPOLOGY_INFO[topo]["display"],
+                    f"{float(zrec['accuracy']) * 100.0:.1f}%",
+                    fmt_pct(zgap),
+                    f"{float(crec['accuracy']) * 100.0:.1f}%",
+                    fmt_pct(cgap),
+                ])
+            add_table(
+                doc,
+                ["Unseen Topology", "Zero-Shot Accuracy", "Zero-Shot Gap", "Calibrated Accuracy", "Calibrated Gap"],
+                comparison_rows,
+            )
+            doc.add_paragraph(
+                "This table is included so the report can keep zero-shot generalization as the base objective, while also "
+                "showing that the few-shot calibration module is an additional contribution that improves deployment on the unseen topologies."
+            )
 
     doc.add_heading("5. Expert Selection, Accuracy, and Training Notes", level=1)
     expert_rows = []
@@ -800,11 +1039,12 @@ def build_report():
             "chooser under the failure scenarios themselves. For each failed timestep, the gate predicts an "
             "expert, and the report logs whether that chosen expert changes relative to normal conditions."
         )
-        doc.add_paragraph(
-            "Important reading note: Accuracy here is strict exact-oracle expert accuracy. Therefore, a row can "
-            "show BN%=100%, GNN+%=0%, and Accuracy=100.0% at the same time, because MetaGate chose Bottleneck "
-            "on every failure timestep and Bottleneck was also the oracle expert on every failure timestep."
-        )
+        if INCLUDE_FAILURE_FIX_NOTE:
+            doc.add_paragraph(
+                "Important reading note: Accuracy here is strict exact-oracle expert accuracy. Therefore, a row can "
+                "show BN%=100%, GNN+%=0%, and Accuracy=100.0% at the same time, because MetaGate chose Bottleneck "
+                "on every failure timestep and Bottleneck was also the oracle expert on every failure timestep."
+            )
         scenario_rows = []
         normal_dominant = {
             topo: results[results["topology"] == topo]["metagate_selector"].value_counts().idxmax()
@@ -839,7 +1079,7 @@ def build_report():
                 f"{changed}/{compared}",
             ])
         add_table(doc, ["Scenario", "Accuracy", "Oracle Gap", "BN%", "TopK%", "Sens%", "GNN+%", "Changed Topologies"], scenario_rows)
-        if compare_summary is not None and COMPARE_DIR != OUTPUT_DIR and (COMPARE_DIR / "metagate_failure_results.csv").exists():
+        if INCLUDE_FAILURE_COMPARE_TABLE and compare_summary is not None and COMPARE_DIR != OUTPUT_DIR and (COMPARE_DIR / "metagate_failure_results.csv").exists():
             try:
                 prev_failure_results = pd.read_csv(COMPARE_DIR / "metagate_failure_results.csv")
                 if "dataset" in prev_failure_results.columns:
@@ -989,17 +1229,72 @@ def build_report():
         f"Mean total time (end-to-end): {mean_total:.1f} ms."
     )
 
-    doc.add_heading("11. Limitations (Honest Assessment)", level=1)
+    doc.add_heading("11. Complexity Analysis", level=1)
+    doc.add_paragraph(
+        "The complexity discussion below is limited to the methods and runtime components that are actually present "
+        "in this MetaGate+GNN+ zero-shot bundle. Because the online gate constructs proposals from all 4 experts "
+        "before making a decision, the runtime controller cost is broader than a single-expert system."
+    )
+    doc.add_heading("11.1 Theoretical Complexity", level=2)
+    add_dataframe_table(doc, build_complexity_rows(), font_size=8)
+    doc.add_heading("11.2 Numeric Controller-Cost Summary", level=2)
+    doc.add_paragraph(
+        "These are measured controller runtime statistics from the current pure zero-shot MetaGate+GNN+ bundle. "
+        "They complement, rather than replace, the theoretical complexity discussion above."
+    )
+    add_dataframe_table(doc, build_complexity_numeric_rows(timing), font_size=8)
+
+    doc.add_heading("12. Model-Based SDN Metrics and Packet-SDN Companion Validation", level=1)
+    doc.add_paragraph(
+        "The integrated MetaGate+GNN+ zero-shot evaluation does not directly generate packet-level SDN metrics such "
+        "as throughput, packet loss, jitter, rule-install delay, and recovery delay. To keep the deployment story "
+        "complete in one document, this section imports the validated fixed GNN+ packet-SDN companion branch as a "
+        "companion systems-level reference. These SDN metrics are model-based analytical estimates, not live Mininet measurements."
+    )
+    doc.add_heading("12.1 SDN Metrics Philosophy", level=2)
+    add_dataframe_table(doc, build_sdn_metrics_formula_rows(), font_size=8)
+    doc.add_paragraph(
+        "No live packet generator or Mininet dataplane claim is made here. The formulas and tables below are "
+        "included as a companion validation layer around the same GNN+ family, not as a replacement for the "
+        "MetaGate zero-shot results above."
+    )
+    if packet_sdn_summary is not None and packet_sdn_metrics is not None:
+        companion_summary = build_packet_sdn_companion_summary(packet_sdn_summary, packet_sdn_metrics)
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        companion_summary.to_csv(COMPANION_SDN_SUMMARY_CSV, index=False)
+
+        doc.add_heading("12.2 Companion Packet-SDN Summary by Method", level=2)
+        add_dataframe_table(doc, companion_summary, font_size=8)
+        doc.add_paragraph(
+            "This summary table comes from the fixed 4-method packet-SDN branch (ECMP, Bottleneck, GNN, GNN+) and is "
+            "included so the full report still contains model-based SDN deployment metrics alongside the zero-shot MetaGate study."
+        )
+
+        for image_name, caption in [
+            ("mlu_comparison_normal.png", "Companion packet-SDN MLU comparison across all 8 topologies."),
+            ("throughput_comparison_normal.png", "Companion packet-SDN throughput comparison across all 8 topologies."),
+            ("decision_time_comparison.png", "Companion packet-SDN controller decision-time comparison."),
+            ("failure_recovery_gnnplus.png", "Companion packet-SDN GNN+ failure recovery comparison."),
+        ]:
+            add_image(doc, PACKET_SDN_PLOTS_DIR / image_name, caption)
+
+        doc.add_heading("12.3 Companion Packet-SDN Tables", level=2)
+        known_metrics = packet_sdn_metrics[packet_sdn_metrics["Status"] == "Known"].reset_index(drop=True)
+        unseen_metrics = packet_sdn_metrics[packet_sdn_metrics["Status"] == "Unseen"].reset_index(drop=True)
+        add_dataframe_chunks(doc, known_metrics, "Known-topology packet-SDN metrics", chunk_size=24, font_size=8)
+        add_dataframe_chunks(doc, unseen_metrics, "Unseen-topology packet-SDN metrics", chunk_size=12, font_size=8)
+
+    doc.add_heading("13. Limitations (Honest Assessment)", level=1)
     limitations = [
         "This report validates MetaGate with GNN+ as the learned expert, but it does not include a separate Stable MetaGate extension.",
         "Paper baselines such as FlexDATE, FlexEntry, and ERODRL are still unavailable in the current runnable repository.",
-        "The calibration phase uses 10 validation traffic matrices from the target topology, so the framing remains zero-shot gate training with few-shot calibration rather than pure zero-shot deployment.",
+        "This report evaluates pure zero-shot deployment, so there is no topology-specific calibration to rescue difficult unseen cases." if ZERO_SHOT_ONLY else "The calibration phase uses 10 validation traffic matrices from the target topology, so the framing remains zero-shot gate training with few-shot calibration rather than pure zero-shot deployment.",
         "The reported results are limited to the current runnable bundle and should not be mixed numerically with earlier report branches unless the scope is stated explicitly.",
     ]
     for item in limitations:
         doc.add_paragraph(item, style="List Bullet")
 
-    doc.add_heading("12. Exact Method Description for Thesis", level=1)
+    doc.add_heading("14. Exact Method Description for Thesis", level=1)
     doc.add_paragraph(
         "We use a two-stage expert-selection framework for traffic engineering. An MLP MetaGate "
         "(3-layer, 128-128-64-4 with BatchNorm and dropout 0.3) selects among four routing experts: "
@@ -1012,6 +1307,30 @@ def build_report():
         "MLP softmax during test-time inference. Germany50 and VtlWavenet2011 are held out from gate-weight "
         "training and are used as unseen-topology tests."
     )
+    if ZERO_SHOT_ONLY:
+        doc.paragraphs[-1].text = (
+            "We use a two-stage expert-selection framework for traffic engineering. An MLP MetaGate "
+            "(3-layer, 128-128-64-4 with BatchNorm and dropout 0.3) selects among four routing experts: "
+            "Bottleneck, Top-K by Demand, Sensitivity Analysis, and GNN+-based selection, all operating "
+            "with K_crit = 40 critical flows. Oracle labels are generated by running all four experts "
+            "through LP optimization and selecting the expert with minimum MLU for each traffic matrix. "
+            "The gate is trained on pooled oracle labels from 6 known topologies only. During evaluation, "
+            "the trained gate is applied directly with no target-topology calibration, no Bayesian prior "
+            "fusion, and no weight updates. Germany50 and VtlWavenet2011 are held out from gate-weight "
+            "training and are used as pure unseen-topology zero-shot tests."
+        )
+
+    doc.add_heading("15. Output Files", level=1)
+    output_rows = [
+        ["Primary report", str(OUTPUT_DOC.relative_to(PROJECT_ROOT))],
+        ["Audit note", str(AUDIT_MD.relative_to(PROJECT_ROOT))],
+        ["MetaGate summary CSV", str(SUMMARY_CSV.relative_to(PROJECT_ROOT))],
+        ["MetaGate failure summary CSV", str(FAILURE_SUMMARY_CSV.relative_to(PROJECT_ROOT)) if FAILURE_SUMMARY_CSV.exists() else "N/A"],
+        ["Zero-shot unseen summary CSV", str(ZERO_SHOT_UNSEEN_SUMMARY_CSV.relative_to(PROJECT_ROOT)) if ZERO_SHOT_UNSEEN_SUMMARY_CSV.exists() else "N/A"],
+        ["Companion SDN summary CSV", str(COMPANION_SDN_SUMMARY_CSV.relative_to(PROJECT_ROOT)) if COMPANION_SDN_SUMMARY_CSV.exists() else "N/A"],
+        ["Companion packet-SDN metrics source", str(PACKET_SDN_METRICS_CSV.relative_to(PROJECT_ROOT)) if PACKET_SDN_METRICS_CSV.exists() else "N/A"],
+    ]
+    add_table(doc, ["Artifact", "Path"], output_rows, font_size=9)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     doc.save(OUTPUT_DOC)
@@ -1024,6 +1343,7 @@ def build_report():
         "- The learned expert in this report is GNN+, not the old Original GNN.",
         "- Selector percentages and accuracy values come from the new integrated MetaGate+GNN+ evaluation.",
         f"- Failure section included: {'yes' if not failure_results.empty else 'no'}",
+        f"- Companion packet-SDN SDN metrics included: {'yes' if packet_sdn_metrics is not None else 'no'}",
         f"- Compared against previous bundle: `{COMPARE_DIR.relative_to(PROJECT_ROOT)}`" if COMPARE_DIR != OUTPUT_DIR else "- Compared against previous bundle: no",
         "- Training upgrade documented: soft labels from expert MLUs, routing-aware regret penalty, and stabilized failure features.",
     ]

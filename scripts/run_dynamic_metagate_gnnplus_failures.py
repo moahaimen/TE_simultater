@@ -29,6 +29,7 @@ K_CRIT = 40
 DEVICE = "cpu"
 N_CALIB = 10
 FEAT_DIM = 49
+DISABLE_CALIBRATION = os.environ.get("METAGATE_GNNPLUS_DISABLE_CALIBRATION", "0") == "1"
 
 OUTPUT_DIR = Path(
     os.environ.get(
@@ -42,6 +43,7 @@ FAILURE_SUMMARY_CSV = OUTPUT_DIR / "metagate_failure_summary.csv"
 FAILURE_DECISIONS_CSV = OUTPUT_DIR / "metagate_failure_decisions.csv"
 FAILURE_CALIB_CSV = OUTPUT_DIR / "metagate_failure_calibration.csv"
 FAILURE_AUDIT_JSON = OUTPUT_DIR / "metagate_failure_summary.json"
+FAILURE_SDN_METRICS_CSV = OUTPUT_DIR / "metagate_failure_sdn_metrics.csv"
 
 FAILURE_SCENARIOS = [
     "single_link_failure",
@@ -186,6 +188,8 @@ def evaluate_failure_timestep(M, dataset, path_library, timestep: int, scenario:
 
     expert_mlus = {}
     expert_lp_ms = {}
+    expert_splits = {}
+    expert_routings = {}
     for name in SELECTOR_NAMES:
         lp_start = time.perf_counter()
         try:
@@ -199,14 +203,20 @@ def evaluate_failure_timestep(M, dataset, path_library, timestep: int, scenario:
             )
             routing = M["apply_routing"](effective_tm, lp.splits, path_library, effective_caps)
             expert_mlus[name] = float(routing.mlu)
+            expert_splits[name] = [np.asarray(s, dtype=float).copy() for s in lp.splits]
+            expert_routings[name] = routing
         except Exception:
             expert_mlus[name] = float("inf")
+            expert_splits[name] = [np.asarray(s, dtype=float).copy() for s in ecmp_base]
+            expert_routings[name] = M["apply_routing"](effective_tm, ecmp_base, path_library, effective_caps)
         expert_lp_ms[name] = (time.perf_counter() - lp_start) * 1000
 
     return {
         "features": features,
         "expert_mlus": expert_mlus,
         "expert_lp_ms": expert_lp_ms,
+        "expert_splits": expert_splits,
+        "expert_routings": expert_routings,
         "expert_timing": expert_timing,
         "expert_total_ms": expert_total_ms,
         "failure_ctx": failure_ctx,
@@ -217,6 +227,9 @@ def evaluate_failure_timestep(M, dataset, path_library, timestep: int, scenario:
 
 
 def calibrate_for_failure(M, gate, dataset, path_library, scenario: str, gnnplus_model):
+    if DISABLE_CALIBRATION:
+        gate.clear_calibration()
+        return np.zeros(len(SELECTOR_NAMES), dtype=np.int64), 0
     val_indices = M["split_indices"](dataset, "val")[:N_CALIB]
     counts = np.zeros(len(SELECTOR_NAMES), dtype=np.int64)
     valid = 0
@@ -269,10 +282,14 @@ def main():
     for dataset, path_library in datasets:
         topo_type = "unseen" if dataset.key in UNSEEN_TOPOLOGIES else "known"
         test_indices = M["split_indices"](dataset, "test")
+        topo_mapping = M["SDNTopologyMapping"].from_mininet(dataset.nodes, dataset.edges, dataset.od_pairs)
         for scenario in FAILURE_SCENARIOS:
             print(f"\n[{topo_type}] {dataset.key} / {scenario}")
             counts, valid = calibrate_for_failure(M, gate, dataset, path_library, scenario, gnnplus_model)
             prior = getattr(gate, "_calibration_prior", None)
+            current_splits = [np.asarray(s, dtype=float).copy() for s in M["ecmp_splits"](path_library)]
+            current_groups, _ = M["build_ecmp_baseline_rules"](path_library, topo_mapping, dataset.edges)
+            prev_latency_by_od = None
             calibration_rows.append(
                 {
                     "dataset": dataset.key,
@@ -289,7 +306,9 @@ def main():
                     "oracle_gnnplus": int(counts[3]),
                 }
             )
-            if prior is not None:
+            if DISABLE_CALIBRATION:
+                print("  Pure zero-shot mode: calibration disabled")
+            elif prior is not None:
                 print(
                     f"  Calibration prior: BN={prior[0]:.2f} TopK={prior[1]:.2f} "
                     f"Sens={prior[2]:.2f} GNN+={prior[3]:.2f}"
@@ -313,8 +332,32 @@ def main():
                     + float(mlp_ms)
                 )
                 total_ms = decision_ms + float(step["expert_lp_ms"][pred_name])
-
+                selected_splits = step["expert_splits"][pred_name]
+                selected_ods = step["selector_results"][pred_name]
+                selected_routing = step["expert_routings"][pred_name]
                 ctx = step["failure_ctx"]
+                rule_start = time.perf_counter()
+                new_groups, _ = M["splits_to_openflow_rules"](
+                    selected_splits,
+                    selected_ods,
+                    path_library,
+                    topo_mapping,
+                    dataset.edges,
+                )
+                changed_groups = M["compute_rule_diff"](current_groups, new_groups)
+                flow_table_updates = int(len(changed_groups))
+                rule_install_delay_ms = (time.perf_counter() - rule_start) * 1000
+                telemetry_selected = M["compute_reactive_telemetry"](
+                    ctx["effective_tm"],
+                    selected_splits,
+                    path_library,
+                    selected_routing,
+                    ctx["weights"],
+                    prev_latency_by_od=prev_latency_by_od,
+                )
+                disturbance = float(M["compute_disturbance"](current_splits, selected_splits, ctx["effective_tm"]))
+                failure_recovery_ms = float(total_ms + rule_install_delay_ms)
+
                 results_rows.append(
                     {
                         "dataset": dataset.key,
@@ -334,6 +377,15 @@ def main():
                         "pre_failure_mlu": float(ctx["pre_failure_mlu"]),
                         "post_failure_ecmp_mlu": float(ctx["post_failure_ecmp_mlu"]),
                         "failed_links": int(len(ctx["failed_links"])),
+                        "throughput": float(telemetry_selected.throughput),
+                        "mean_latency": float(telemetry_selected.mean_latency),
+                        "p95_latency": float(telemetry_selected.p95_latency),
+                        "packet_loss": float(telemetry_selected.packet_loss),
+                        "jitter": float(telemetry_selected.jitter),
+                        "disturbance": disturbance,
+                        "flow_table_updates": flow_table_updates,
+                        "rule_install_delay_ms": float(rule_install_delay_ms),
+                        "failure_recovery_ms": failure_recovery_ms,
                         "t_bn_ms": float(step["expert_timing"]["bottleneck"]),
                         "t_topk_ms": float(step["expert_timing"]["topk"]),
                         "t_sens_ms": float(step["expert_timing"]["sensitivity"]),
@@ -360,6 +412,9 @@ def main():
                         "prob_gnnplus": float(probs[3]),
                     }
                 )
+                current_splits = selected_splits
+                current_groups = new_groups
+                prev_latency_by_od = np.asarray(telemetry_selected.latency_by_od, dtype=float)
 
             sub = pd.DataFrame([r for r in results_rows if r["dataset"] == dataset.key and r["scenario"] == scenario])
             if not sub.empty:
@@ -386,6 +441,15 @@ def main():
             gnnplus_mlu=("gnnplus_mlu", "mean"),
             pre_failure_mlu=("pre_failure_mlu", "mean"),
             post_failure_ecmp_mlu=("post_failure_ecmp_mlu", "mean"),
+            throughput=("throughput", "mean"),
+            mean_latency=("mean_latency", "mean"),
+            p95_latency=("p95_latency", "mean"),
+            packet_loss=("packet_loss", "mean"),
+            jitter=("jitter", "mean"),
+            mean_disturbance=("disturbance", "mean"),
+            flow_table_updates=("flow_table_updates", "mean"),
+            rule_install_delay_ms=("rule_install_delay_ms", "mean"),
+            failure_recovery_ms=("failure_recovery_ms", "mean"),
             t_decision_ms=("t_decision_ms", "mean"),
             t_total_ms=("t_total_ms", "mean"),
             n_timesteps=("timestep", "count"),
@@ -400,6 +464,38 @@ def main():
     summary_df.to_csv(FAILURE_SUMMARY_CSV, index=False)
     decisions_df.to_csv(FAILURE_DECISIONS_CSV, index=False)
     calibration_df.to_csv(FAILURE_CALIB_CSV, index=False)
+    (
+        summary_df[[
+            "dataset",
+            "topology_type",
+            "scenario",
+            "metagate_mlu",
+            "throughput",
+            "mean_disturbance",
+            "mean_latency",
+            "p95_latency",
+            "packet_loss",
+            "jitter",
+            "flow_table_updates",
+            "rule_install_delay_ms",
+            "failure_recovery_ms",
+            "t_decision_ms",
+            "t_total_ms",
+        ]]
+        .rename(
+            columns={
+                "dataset": "topology",
+                "topology_type": "status",
+                "metagate_mlu": "mean_mlu",
+                "mean_latency": "mean_latency_au",
+                "p95_latency": "p95_latency_au",
+                "jitter": "jitter_au",
+                "t_decision_ms": "decision_time_ms",
+            }
+        )
+        .assign(status=lambda df: df["status"].str.lower())
+        .to_csv(FAILURE_SDN_METRICS_CSV, index=False)
+    )
 
     overall = {
         "scenarios": FAILURE_SCENARIOS,
