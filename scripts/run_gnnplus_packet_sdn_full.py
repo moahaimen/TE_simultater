@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
 from collections import defaultdict
 
@@ -43,6 +44,11 @@ from sdn.openflow_adapter import (
     OFGroupMod, OFFlowMod,
 )
 from phase3.state_builder import compute_telemetry, TelemetryConfig
+from phase1_reactive.routing.path_cache import (
+    assert_selected_ods_have_paths,
+    build_modified_paths,
+    surviving_od_mask,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -159,7 +165,7 @@ def gnnplus_select_critical(model, dataset, path_library, tm_vector, k_crit=K_CR
         )
 
         tm_arr = np.asarray(tm_vector, dtype=np.float64)
-        active_mask = tm_arr > 1e-12
+        active_mask = (tm_arr > 1e-12) & surviving_od_mask(path_library)
 
         selected, info = model.select_critical_flows(
             graph_data=graph_data,
@@ -170,6 +176,7 @@ def gnnplus_select_critical(model, dataset, path_library, tm_vector, k_crit=K_CR
         )
 
         logger.debug(f"GNN+ selected {len(selected)} flows, k_used={info.get('k_used', 'N/A')}")
+        assert_selected_ods_have_paths(path_library, selected, context=f"{dataset.key}:gnnplus")
         return selected
     except Exception as e:
         logger.warning(f"GNN+ selection failed: {e}, falling back to bottleneck")
@@ -228,6 +235,139 @@ def load_gnn_model(dataset, path_library):
     except Exception as e:
         logger.warning(f"Could not load GNN model: {e}")
         return None
+
+
+def gnn_select_critical(model, dataset, path_library, tm_vector, k_crit=K_CRIT):
+    """Select critical flows using the original GNN with path-valid active masking."""
+    try:
+        import torch
+
+        graph_data = model._build_graph_tensors(dataset, device="cpu")
+        od_data = model._build_od_features(dataset, tm_vector, path_library, device="cpu")
+        active_mask = (
+            (np.asarray(tm_vector, dtype=np.float64) > 1e-12)
+            & surviving_od_mask(path_library)
+        ).astype(np.float32)
+        with torch.no_grad():
+            selected, _ = model.select_critical_flows(
+                graph_data,
+                od_data,
+                active_mask=active_mask,
+                k_crit_default=k_crit,
+            )
+        assert_selected_ods_have_paths(path_library, selected, context=f"{dataset.key}:gnn")
+        return selected
+    except Exception as e:
+        logger.debug(f"GNN fallback: {e}")
+        selected = select_bottleneck_critical(tm_vector, ecmp_splits(path_library), path_library, dataset.capacities, k_crit)
+        assert_selected_ods_have_paths(path_library, selected, context=f"{dataset.key}:gnn_fallback")
+        return selected
+
+
+def solve_selected_path_lp_safe(*, tm_vector, selected_ods, base_splits, path_library, capacities, time_limit_sec, context):
+    assert_selected_ods_have_paths(path_library, selected_ods, context=context)
+    return solve_selected_path_lp(
+        tm_vector=tm_vector,
+        selected_ods=selected_ods,
+        base_splits=base_splits,
+        path_library=path_library,
+        capacities=capacities,
+        time_limit_sec=time_limit_sec,
+    )
+
+
+def _build_dataset_view(dataset: TEDataset, *, edges, capacities, weights):
+    return SimpleNamespace(
+        key=dataset.key,
+        name=dataset.name,
+        nodes=dataset.nodes,
+        edges=list(edges),
+        capacities=np.asarray(capacities, dtype=float),
+        weights=np.asarray(weights, dtype=float),
+        od_pairs=dataset.od_pairs,
+        metadata=dataset.metadata,
+    )
+
+
+def _build_failure_execution_state(
+    *,
+    scenario: str,
+    tm_vector: np.ndarray,
+    dataset: TEDataset,
+    path_library: PathLibrary,
+    capacities: np.ndarray,
+    weights: np.ndarray,
+    normal_routing,
+) -> dict:
+    failure_mask = np.ones(len(capacities), dtype=float)
+    failed_edges: list[int] = []
+    effective_tm = np.asarray(tm_vector, dtype=float)
+    effective_path_library = path_library
+    effective_caps = np.asarray(capacities, dtype=float)
+    effective_weights = np.asarray(weights, dtype=float)
+    effective_dataset = dataset
+
+    if scenario == "single_link_failure":
+        fail_idx = int(np.argmax(np.asarray(normal_routing.utilization)))
+        failed_edges = [fail_idx]
+    elif scenario == "random_link_failure_1":
+        failed_edges = [random.randint(0, len(capacities) - 1)]
+    elif scenario == "random_link_failure_2":
+        failed_edges = random.sample(range(len(capacities)), min(2, len(capacities)))
+    elif scenario == "capacity_degradation_50":
+        util = np.asarray(normal_routing.utilization)
+        degraded = np.where(util > 0.5)[0].tolist()
+        for idx in degraded:
+            failure_mask[idx] = 0.5
+        effective_caps = np.asarray(capacities, dtype=float) * failure_mask
+        effective_dataset = _build_dataset_view(
+            dataset,
+            edges=dataset.edges,
+            capacities=effective_caps,
+            weights=weights,
+        )
+    elif scenario == "traffic_spike_2x":
+        tm_spike = np.asarray(tm_vector, dtype=float).copy()
+        top_demands = np.argsort(tm_vector)[-K_CRIT:]
+        tm_spike[top_demands] *= 2.0
+        effective_tm = tm_spike
+    else:
+        raise ValueError(f"Unsupported failure scenario: {scenario}")
+
+    if failed_edges:
+        for idx in failed_edges:
+            failure_mask[int(idx)] = 0.0
+        keep = [idx for idx in range(len(dataset.edges)) if idx not in set(int(x) for x in failed_edges)]
+        kept_edges = [dataset.edges[idx] for idx in keep]
+        kept_caps = np.asarray([capacities[idx] for idx in keep], dtype=float)
+        kept_weights = np.asarray([weights[idx] for idx in keep], dtype=float)
+        effective_path_library = build_modified_paths(
+            dataset.nodes,
+            kept_edges,
+            kept_weights,
+            dataset.od_pairs,
+            k_paths=K_PATHS,
+        )
+        effective_caps = kept_caps
+        effective_weights = kept_weights
+        effective_dataset = _build_dataset_view(
+            dataset,
+            edges=kept_edges,
+            capacities=kept_caps,
+            weights=kept_weights,
+        )
+
+    effective_ecmp = ecmp_splits(effective_path_library)
+    return {
+        "effective_tm": effective_tm,
+        "effective_path_library": effective_path_library,
+        "effective_caps": effective_caps,
+        "effective_weights": effective_weights,
+        "effective_dataset": effective_dataset,
+        "effective_ecmp": effective_ecmp,
+        "failure_mask": failure_mask,
+        "failed_edges": failed_edges,
+    }
 
 
 # ── SDN Benchmark Core ─────────────────────────────────────────────────
@@ -297,56 +437,51 @@ def run_sdn_cycle(
         new_splits = ospf_splits(path_library)
     elif method == "bottleneck":
         selected_ods = select_bottleneck_critical(tm_vector, ecmp_base, path_library, effective_caps, K_CRIT)
-        lp_result = solve_selected_path_lp(
+        lp_result = solve_selected_path_lp_safe(
             tm_vector=tm_vector, selected_ods=selected_ods, base_splits=ecmp_base,
             path_library=path_library, capacities=effective_caps, time_limit_sec=20,
+            context=f"{dataset.key}:{method}:normal_cycle",
         )
         new_splits = [s.copy() for s in lp_result.splits]
     elif method == "topk":
         selected_ods = select_topk_by_demand(tm_vector, K_CRIT)
-        lp_result = solve_selected_path_lp(
+        lp_result = solve_selected_path_lp_safe(
             tm_vector=tm_vector, selected_ods=selected_ods, base_splits=ecmp_base,
             path_library=path_library, capacities=effective_caps, time_limit_sec=20,
+            context=f"{dataset.key}:{method}:normal_cycle",
         )
         new_splits = [s.copy() for s in lp_result.splits]
     elif method == "sensitivity":
         selected_ods = select_sensitivity_critical(tm_vector, ecmp_base, path_library, effective_caps, K_CRIT)
-        lp_result = solve_selected_path_lp(
+        lp_result = solve_selected_path_lp_safe(
             tm_vector=tm_vector, selected_ods=selected_ods, base_splits=ecmp_base,
             path_library=path_library, capacities=effective_caps, time_limit_sec=20,
+            context=f"{dataset.key}:{method}:normal_cycle",
         )
         new_splits = [s.copy() for s in lp_result.splits]
     elif method == "gnn" and gnn_model is not None:
-        try:
-            import torch
-            graph_data = gnn_model._build_graph_tensors(gnn_model._dataset, device="cpu")
-            od_data = gnn_model._build_od_features(gnn_model._dataset, tm_vector, path_library, device="cpu")
-            active_mask = (np.asarray(tm_vector, dtype=np.float64) > 1e-12).astype(np.float32)
-            with torch.no_grad():
-                selected_ods, _ = gnn_model.select_critical_flows(
-                    graph_data, od_data, active_mask=active_mask, k_crit_default=K_CRIT,
-                )
-        except Exception as e:
-            logger.debug(f"GNN fallback: {e}")
-            selected_ods = select_bottleneck_critical(tm_vector, ecmp_base, path_library, effective_caps, K_CRIT)
-        lp_result = solve_selected_path_lp(
+        selected_ods = gnn_select_critical(gnn_model, dataset, path_library, tm_vector, K_CRIT)
+        lp_result = solve_selected_path_lp_safe(
             tm_vector=tm_vector, selected_ods=selected_ods, base_splits=ecmp_base,
             path_library=path_library, capacities=effective_caps, time_limit_sec=20,
+            context=f"{dataset.key}:{method}:normal_cycle",
         )
         new_splits = [s.copy() for s in lp_result.splits]
     elif method == "gnnplus" and gnnplus_model is not None:
         selected_ods = gnnplus_select_critical(gnnplus_model, dataset, path_library, tm_vector, K_CRIT)
-        lp_result = solve_selected_path_lp(
+        lp_result = solve_selected_path_lp_safe(
             tm_vector=tm_vector, selected_ods=selected_ods, base_splits=ecmp_base,
             path_library=path_library, capacities=effective_caps, time_limit_sec=20,
+            context=f"{dataset.key}:{method}:normal_cycle",
         )
         new_splits = [s.copy() for s in lp_result.splits]
     else:
         # Fallback to bottleneck
         selected_ods = select_bottleneck_critical(tm_vector, ecmp_base, path_library, effective_caps, K_CRIT)
-        lp_result = solve_selected_path_lp(
+        lp_result = solve_selected_path_lp_safe(
             tm_vector=tm_vector, selected_ods=selected_ods, base_splits=ecmp_base,
             path_library=path_library, capacities=effective_caps, time_limit_sec=20,
+            context=f"{dataset.key}:{method}:normal_cycle",
         )
         new_splits = [s.copy() for s in lp_result.splits]
 
@@ -413,93 +548,63 @@ def run_failure_scenario(
     normal_routing = apply_routing(tm_vector, ecmp_base, path_library, capacities)
     pre_failure_mlu = float(normal_routing.mlu)
     
-    # Determine failure mask based on scenario
-    failure_mask = np.ones(len(capacities))
-    
-    if scenario == "single_link_failure":
-        # Fail highest utilization link
-        util = np.asarray(normal_routing.utilization)
-        fail_idx = int(np.argmax(util))
-        failure_mask[fail_idx] = 0.0
-    elif scenario == "random_link_failure_1":
-        # Fail one random link
-        fail_idx = random.randint(0, len(capacities) - 1)
-        failure_mask[fail_idx] = 0.0
-    elif scenario == "random_link_failure_2":
-        # Fail two random links
-        fail_indices = random.sample(range(len(capacities)), min(2, len(capacities)))
-        for idx in fail_indices:
-            failure_mask[idx] = 0.0
-    elif scenario == "capacity_degradation_50":
-        # Degrade congested links by 50%
-        util = np.asarray(normal_routing.utilization)
-        congested = np.where(util > 0.5)[0]
-        for idx in congested:
-            failure_mask[idx] = 0.5
-    elif scenario == "traffic_spike_2x":
-        # Double traffic on top demands (handled via tm_vector modification)
-        pass  # No link failure, just traffic increase
-    
-    # Compute post-failure MLU (without recovery)
-    failed_caps = capacities * failure_mask
-    post_failure_routing = apply_routing(tm_vector, ecmp_base, path_library, failed_caps)
+    failure_state = _build_failure_execution_state(
+        scenario=scenario,
+        tm_vector=tm_vector,
+        dataset=dataset,
+        path_library=path_library,
+        capacities=capacities,
+        weights=weights,
+        normal_routing=normal_routing,
+    )
+    effective_tm = failure_state["effective_tm"]
+    effective_caps = failure_state["effective_caps"]
+    effective_path_library = failure_state["effective_path_library"]
+    effective_dataset = failure_state["effective_dataset"]
+    effective_ecmp = failure_state["effective_ecmp"]
+    failure_mask = failure_state["failure_mask"]
+
+    # Compute post-failure MLU (without recovery) on the surviving topology state.
+    post_failure_routing = apply_routing(effective_tm, effective_ecmp, effective_path_library, effective_caps)
     
     # Run recovery
     t_start = time.perf_counter()
     
-    if scenario == "traffic_spike_2x":
-        # Modify TM for spike
-        tm_spike = tm_vector.copy()
-        top_demands = np.argsort(tm_vector)[-K_CRIT:]
-        tm_spike[top_demands] *= 2.0
-        effective_tm = tm_spike
-        effective_caps = capacities
-    else:
-        effective_tm = tm_vector
-        effective_caps = failed_caps
-    
     # Run method under failure
     if method == "ecmp":
-        recovery_splits = [s.copy() for s in ecmp_base]
+        recovery_splits = [s.copy() for s in effective_ecmp]
     elif method == "bottleneck":
-        selected = select_bottleneck_critical(effective_tm, ecmp_base, path_library, effective_caps, K_CRIT)
-        lp_result = solve_selected_path_lp(
-            tm_vector=effective_tm, selected_ods=selected, base_splits=ecmp_base,
-            path_library=path_library, capacities=effective_caps, time_limit_sec=20,
+        selected = select_bottleneck_critical(effective_tm, effective_ecmp, effective_path_library, effective_caps, K_CRIT)
+        lp_result = solve_selected_path_lp_safe(
+            tm_vector=effective_tm, selected_ods=selected, base_splits=effective_ecmp,
+            path_library=effective_path_library, capacities=effective_caps, time_limit_sec=20,
+            context=f"{dataset.key}:{scenario}:{method}",
         )
         recovery_splits = [s.copy() for s in lp_result.splits]
     elif method == "gnn" and gnn_model is not None:
-        try:
-            import torch
-            graph_data = gnn_model._build_graph_tensors(gnn_model._dataset, device="cpu")
-            od_data = gnn_model._build_od_features(gnn_model._dataset, effective_tm, path_library, device="cpu")
-            active_mask = (np.asarray(effective_tm, dtype=np.float64) > 1e-12).astype(np.float32)
-            with torch.no_grad():
-                selected, _ = gnn_model.select_critical_flows(
-                    graph_data, od_data, active_mask=active_mask, k_crit_default=K_CRIT,
-                )
-        except Exception:
-            selected = select_bottleneck_critical(effective_tm, ecmp_base, path_library, effective_caps, K_CRIT)
-        lp_result = solve_selected_path_lp(
-            tm_vector=effective_tm, selected_ods=selected, base_splits=ecmp_base,
-            path_library=path_library, capacities=effective_caps, time_limit_sec=20,
+        selected = gnn_select_critical(gnn_model, effective_dataset, effective_path_library, effective_tm, K_CRIT)
+        lp_result = solve_selected_path_lp_safe(
+            tm_vector=effective_tm, selected_ods=selected, base_splits=effective_ecmp,
+            path_library=effective_path_library, capacities=effective_caps, time_limit_sec=20,
+            context=f"{dataset.key}:{scenario}:{method}",
         )
         recovery_splits = [s.copy() for s in lp_result.splits]
     elif method == "gnnplus" and gnnplus_model is not None:
-        selected = gnnplus_select_critical(gnnplus_model, dataset, path_library, effective_tm, K_CRIT)
-        lp_result = solve_selected_path_lp(
-            tm_vector=effective_tm, selected_ods=selected, base_splits=ecmp_base,
-            path_library=path_library, capacities=effective_caps, time_limit_sec=20,
+        selected = gnnplus_select_critical(gnnplus_model, effective_dataset, effective_path_library, effective_tm, K_CRIT)
+        lp_result = solve_selected_path_lp_safe(
+            tm_vector=effective_tm, selected_ods=selected, base_splits=effective_ecmp,
+            path_library=effective_path_library, capacities=effective_caps, time_limit_sec=20,
+            context=f"{dataset.key}:{scenario}:{method}",
         )
         recovery_splits = [s.copy() for s in lp_result.splits]
     else:
-        recovery_splits = [s.copy() for s in ecmp_base]
+        recovery_splits = [s.copy() for s in effective_ecmp]
     
     t_end = time.perf_counter()
     recovery_ms = (t_end - t_start) * 1000
     
     # Post-recovery MLU
-    post_routing = apply_routing(effective_tm, recovery_splits, path_library, effective_caps)
+    post_routing = apply_routing(effective_tm, recovery_splits, effective_path_library, effective_caps)
     post_recovery_mlu = float(post_routing.mlu)
     
     return recovery_ms, pre_failure_mlu, post_recovery_mlu, failure_mask

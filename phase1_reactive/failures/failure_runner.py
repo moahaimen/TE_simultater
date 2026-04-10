@@ -33,7 +33,11 @@ from phase1_reactive.eval.common import (
     write_config_snapshot,
 )
 from phase1_reactive.eval.plotting import plot_failure_summary
-from phase1_reactive.routing.path_cache import build_modified_paths
+from phase1_reactive.routing.path_cache import (
+    assert_selected_ods_have_paths,
+    build_modified_paths,
+    surviving_od_mask,
+)
 from phase3.ppo_agent import load_trained_ppo
 from te.baselines import clone_splits, ecmp_splits, ospf_splits, select_bottleneck_critical, select_sensitivity_critical, select_topk_by_demand
 from te.disturbance import compute_disturbance
@@ -59,10 +63,14 @@ def _select_gnn_indices(tm_vector, dataset, path_library, capacities, k_crit, gn
     from phase1_reactive.drl.gnn_selector import build_graph_tensors, build_od_features
     graph_data = build_graph_tensors(dataset, telemetry=telemetry, failure_mask=failure_mask, device=device)
     od_data = build_od_features(dataset, tm_vector, path_library, telemetry=telemetry, device=device)
-    active_mask = (np.asarray(tm_vector, dtype=np.float64) > 1e-12).astype(np.float32)
+    active_mask = (
+        (np.asarray(tm_vector, dtype=np.float64) > 1e-12)
+        & surviving_od_mask(path_library)
+    ).astype(np.float32)
     selected, _ = gnn_model.select_critical_flows(
         graph_data, od_data, active_mask=active_mask, k_crit_default=k_crit,
     )
+    assert_selected_ods_have_paths(path_library, selected, context=f"{dataset.key}:failure_gnn")
     return selected
 
 
@@ -110,6 +118,16 @@ def _build_failure_state(dataset, base_paths, failure_type: str, failed_edges: S
             caps[idx] *= 0.5
             mask[idx] = 1.0
         return {
+            "dataset_view": SimpleNamespace(
+                key=dataset.key,
+                name=dataset.name,
+                nodes=dataset.nodes,
+                edges=dataset.edges,
+                weights=np.asarray(dataset.weights, dtype=float),
+                capacities=caps,
+                od_pairs=dataset.od_pairs,
+                metadata=dataset.metadata,
+            ),
             "path_library": base_paths,
             "capacities": caps,
             "weights": np.asarray(dataset.weights, dtype=float),
@@ -122,6 +140,16 @@ def _build_failure_state(dataset, base_paths, failure_type: str, failed_edges: S
     capacities = np.asarray([dataset.capacities[idx] for idx in keep], dtype=float)
     new_paths = build_modified_paths(dataset.nodes, edges, weights, dataset.od_pairs, k_paths=k_paths)
     return {
+        "dataset_view": SimpleNamespace(
+            key=dataset.key,
+            name=dataset.name,
+            nodes=dataset.nodes,
+            edges=edges,
+            weights=weights,
+            capacities=capacities,
+            od_pairs=dataset.od_pairs,
+            metadata=dataset.metadata,
+        ),
         "path_library": new_paths,
         "capacities": capacities,
         "weights": weights,
@@ -152,6 +180,7 @@ def _select_dqn_topk(q_scores: torch.Tensor, active_mask: torch.Tensor, k_crit: 
 
 
 def _evaluate_candidate(tm_vector, selected, ecmp_base, current_paths, current_caps, current_weights, prev_splits, prev_latency_by_od, lp_time_limit_sec, telemetry_cfg):
+    assert_selected_ods_have_paths(current_paths, selected, context="failure_evaluation")
     lp = solve_selected_path_lp(tm_vector, selected, ecmp_base, current_paths, current_caps, time_limit_sec=lp_time_limit_sec)
     routing = apply_routing(tm_vector, lp.splits, current_paths, current_caps)
     telemetry = compute_reactive_telemetry(tm_vector, lp.splits, current_paths, routing, current_weights, prev_latency_by_od=prev_latency_by_od, cfg=telemetry_cfg)
@@ -175,11 +204,13 @@ def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: s
     for timestep in indices:
         failure_active = int(timestep >= failure_start)
         if failure_active:
+            current_dataset = post_failure["dataset_view"]
             current_paths = post_failure["path_library"]
             current_caps = np.asarray(post_failure["capacities"], dtype=float)
             current_weights = np.asarray(post_failure["weights"], dtype=float)
             failure_mask = np.asarray(post_failure["failure_mask"], dtype=float)
         else:
+            current_dataset = dataset
             current_paths = base_paths
             current_caps = np.asarray(dataset.capacities, dtype=float)
             current_weights = np.asarray(dataset.weights, dtype=float)
@@ -268,7 +299,7 @@ def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: s
             inf_start = time.perf_counter()
             with torch.no_grad():
                 selected = _select_gnn_indices(
-                    tm_vector, dataset, current_paths, current_caps, k_crit,
+                    tm_vector, current_dataset, current_paths, current_caps, k_crit,
                     gnn_model, telemetry=state_telemetry, failure_mask=failure_mask,
                 )
             inference_latency = time.perf_counter() - inf_start
@@ -278,6 +309,7 @@ def _rollout_failure_method(dataset, base_paths, method: str, *, failure_type: s
             status = str(lp.status)
         else:
             selected = _select_indices(method, tm_vector, ecmp_base, current_paths, current_caps, k_crit, prev_selected=prev_selected, failure_mask=failure_mask)
+            assert_selected_ods_have_paths(current_paths, selected, context=f"{dataset.key}:{failure_type}:{method}")
             lp_start = time.perf_counter()
             lp = solve_selected_path_lp(tm_vector, selected, ecmp_base, current_paths, current_caps, time_limit_sec=lp_time_limit_sec)
             lp_runtime = time.perf_counter() - lp_start

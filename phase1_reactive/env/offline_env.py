@@ -10,6 +10,7 @@ import numpy as np
 
 from phase1_reactive.drl.reward import ReactiveRewardConfig, compute_reactive_reward
 from phase1_reactive.drl.state_builder import ReactiveObservation, build_reactive_observation, compute_reactive_telemetry, reactive_reference_latency
+from phase1_reactive.routing.path_cache import assert_selected_ods_have_paths
 from phase3.state_builder import TelemetryConfig
 from te.baselines import clone_splits, ecmp_splits
 from te.disturbance import compute_disturbance
@@ -103,6 +104,11 @@ class ReactiveRoutingEnv:
         timestep = int(self._indices[self.pointer])
         tm_vector = self.tm[timestep]
         selected = [int(x) for x in selected_ods if 0 <= int(x) < len(self.dataset.od_pairs)]
+        assert_selected_ods_have_paths(
+            self.path_library,
+            selected,
+            context=f"{self.env_name}:{self.split_name}:t={timestep}",
+        )
 
         t0 = time.perf_counter()
         lp = solve_selected_path_lp(
