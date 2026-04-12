@@ -49,10 +49,35 @@ class GNNPlusConfig(GNNSelectorConfig):
     learn_k_crit: bool = True
     k_crit_min: int = 15     # bounded: dynamic K ∈ [15, 40]
     k_crit_max: int = 40     # matches all prior experiments
+    feature_variant: str = "legacy"
     device: str = "cpu"
 
 
 _PLUS_TOPOLOGY_CACHE: Dict[tuple, Dict[str, object]] = {}
+_FEATURE_VARIANTS = {"legacy", "section3_physical", "section7_temporal"}
+
+
+def _normalize_feature_variant(feature_variant: Optional[str]) -> str:
+    variant = (feature_variant or "legacy").strip().lower()
+    if variant not in _FEATURE_VARIANTS:
+        raise ValueError(f"Unsupported GNN+ feature variant: {feature_variant}")
+    return variant
+
+
+def _normalize_prev_selected_indicator(
+    prev_selected_indicator: Optional[Sequence[float]],
+    num_od: int,
+) -> np.ndarray:
+    if prev_selected_indicator is None:
+        return np.zeros(int(num_od), dtype=np.float64)
+    prev = np.asarray(prev_selected_indicator, dtype=np.float64).reshape(-1)
+    if prev.size != int(num_od):
+        out = np.zeros(int(num_od), dtype=np.float64)
+        take = min(int(num_od), int(prev.size))
+        if take > 0:
+            out[:take] = prev[:take]
+        prev = out
+    return np.clip(prev, 0.0, 1.0)
 
 
 def _topology_cache_key(dataset, path_library) -> tuple:
@@ -159,33 +184,41 @@ def build_graph_tensors_plus(
     dataset, tm_vector=None, path_library=None,
     telemetry=None, failure_mask=None,
     prev_util=None,
+    prev_tm=None,
+    prev_selected_indicator=None,
+    prev_disturbance=0.0,
+    feature_variant="legacy",
     device="cpu",
 ):
     """Build enhanced graph tensors with richer node and edge features.
 
     Node features [V, 16]:
       0-11: same as original
-      12: ecmp_demand_through_node (normalized) — total demand routed through this node
-      13: congested_neighbor_fraction — fraction of neighbors with util > 0.8
+      12: ecmp_demand_through_node (normalized)
+      13: legacy=congested_neighbor_fraction, section3=node_abs_util_delta,
+          section7=blend(node_abs_util_delta, prev_selected_mass)
       14: max_residual_capacity — max(cap - load) on incident edges, normalized
-      15: clustering_coefficient_proxy — triangles / possible triangles
+      15: legacy=clustering_coefficient_proxy, section3=node_abs_demand_delta,
+          section7=blend(node_abs_demand_delta, prev_disturbance)
 
     Edge features [E, 12]:
       0-7: same as original (cap, log_cap, weight, util, delay, congested, headroom, fail)
       8: num_od_sharing_edge (normalized) — how many active OD paths use this edge
       9: residual_capacity_abs — (cap - load), normalized
-      10: load_change_ratio — load_t / load_{t-1}, normalized to [0, 1]
+      10: legacy=load_change_ratio, section3/section7=absolute_utilization_delta
       11: is_bottleneck — binary: this edge is bottleneck of ≥1 active OD
     """
     if path_library is None:
         raise ValueError("build_graph_tensors_plus requires a path_library for cached topology features")
 
     dev = torch.device(device)
+    variant = _normalize_feature_variant(feature_variant)
     capacities = np.asarray(dataset.capacities, dtype=np.float64)
     weights = np.asarray(dataset.weights, dtype=np.float64)
     cache = _get_plus_topology_cache(dataset, path_library)
     num_nodes = int(cache["num_nodes"])
     num_edges = int(cache["num_edges"])
+    num_od = len(path_library.od_pairs)
     node_to_idx = cache["node_to_idx"]
     src_idx = np.asarray(cache["edge_index_np"][0], dtype=np.int64)
     dst_idx = np.asarray(cache["edge_index_np"][1], dtype=np.int64)
@@ -231,12 +264,16 @@ def build_graph_tensors_plus(
 
     # 10: load_change_ratio
     load_change = np.ones(num_edges, dtype=np.float64) * 0.5  # default = no change (0.5 after norm)
+    util_delta_abs = np.zeros(num_edges, dtype=np.float64)
     if prev_util is not None:
-        prev_load = np.asarray(prev_util, dtype=np.float64)[:num_edges] * capacities
+        prev_util_arr = np.asarray(prev_util, dtype=np.float64)[:num_edges]
+        prev_load = prev_util_arr * capacities
         ratio = load / (prev_load + 1e-12)
         # Clip to [0.5, 2.0] then normalize to [0, 1]
         ratio_clipped = np.clip(ratio, 0.5, 2.0)
         load_change = (ratio_clipped - 0.5) / 1.5  # maps [0.5, 2.0] -> [0, 1]
+        util_delta_abs = np.abs(util - prev_util_arr)
+    util_delta_abs_norm = util_delta_abs / (np.max(util_delta_abs) + 1e-12)
 
     # 11: is_bottleneck — edge is the bottleneck for at least one active OD
     is_bottleneck = np.zeros(num_edges, dtype=np.float64)
@@ -254,9 +291,11 @@ def build_graph_tensors_plus(
                 if util[int(eidx)] >= max_u - 1e-12:
                     is_bottleneck[int(eidx)] = 1.0
 
+    edge_stress_feature = load_change if variant == "legacy" else util_delta_abs_norm
+
     edge_feat = np.stack([
         cap_norm, log_cap, weight_norm, util, delay, congested, headroom, fail,
-        od_per_edge_norm, residual_cap_norm, load_change, is_bottleneck,
+        od_per_edge_norm, residual_cap_norm, edge_stress_feature, is_bottleneck,
     ], axis=1).astype(np.float32)
     edge_features = torch.tensor(edge_feat, dtype=torch.float32, device=dev)
 
@@ -297,7 +336,7 @@ def build_graph_tensors_plus(
         np.add.at(demand_through_node, np.asarray(cache["od_dst"], dtype=np.int64), tm)
     demand_through_node_norm = demand_through_node / (np.max(demand_through_node) + 1e-12)
 
-    # 13: congested_neighbor_fraction
+    # 13: congested_neighbor_fraction (legacy only)
     congested_nodes = ((max_util_in > 0.8) | (max_util_out > 0.8)).astype(np.float64)
     congested_neighbor_frac = (adjacency @ congested_nodes) / np.maximum(neighbor_counts, 1.0)
 
@@ -307,8 +346,51 @@ def build_graph_tensors_plus(
     np.maximum.at(max_residual_cap, dst_idx, residual_cap)
     max_residual_cap_norm = max_residual_cap / (np.max(max_residual_cap) + 1e-12)
 
-    # 15: clustering coefficient proxy (undirected)
+    # 15: clustering coefficient proxy (legacy only)
     clustering = np.asarray(cache["clustering"], dtype=np.float64)
+
+    # Section 3 stress-change replacements
+    node_abs_util_delta = np.zeros(num_nodes, dtype=np.float64)
+    if prev_util is not None:
+        prev_util_arr = np.asarray(prev_util, dtype=np.float64)[:num_edges]
+        abs_delta = np.abs(util - prev_util_arr)
+        np.maximum.at(node_abs_util_delta, src_idx, abs_delta)
+        np.maximum.at(node_abs_util_delta, dst_idx, abs_delta)
+    node_abs_util_delta_norm = node_abs_util_delta / (np.max(node_abs_util_delta) + 1e-12)
+
+    node_abs_demand_delta = np.zeros(num_nodes, dtype=np.float64)
+    if tm_vector is not None and prev_tm is not None:
+        tm = np.asarray(tm_vector, dtype=np.float64)
+        prev_tm_arr = np.asarray(prev_tm, dtype=np.float64)
+        demand_delta = np.abs(tm - prev_tm_arr)
+        np.add.at(node_abs_demand_delta, np.asarray(cache["od_src"], dtype=np.int64), demand_delta)
+        np.add.at(node_abs_demand_delta, np.asarray(cache["od_dst"], dtype=np.int64), demand_delta)
+    node_abs_demand_delta_norm = node_abs_demand_delta / (np.max(node_abs_demand_delta) + 1e-12)
+    prev_selected = _normalize_prev_selected_indicator(prev_selected_indicator, num_od)
+    node_prev_selected_mass = np.zeros(num_nodes, dtype=np.float64)
+    if prev_selected.size:
+        np.add.at(node_prev_selected_mass, np.asarray(cache["od_src"], dtype=np.int64), prev_selected)
+        np.add.at(node_prev_selected_mass, np.asarray(cache["od_dst"], dtype=np.int64), prev_selected)
+    node_prev_selected_mass_norm = node_prev_selected_mass / (np.max(node_prev_selected_mass) + 1e-12)
+    prev_dist_scalar = float(np.clip(prev_disturbance, 0.0, 1.0))
+
+    if variant == "legacy":
+        node_neighbor_feature = congested_neighbor_frac
+        node_tail_feature = clustering
+    elif variant == "section3_physical":
+        node_neighbor_feature = node_abs_util_delta_norm
+        node_tail_feature = node_abs_demand_delta_norm
+    else:
+        node_neighbor_feature = np.clip(
+            0.75 * node_abs_util_delta_norm + 0.25 * node_prev_selected_mass_norm,
+            0.0,
+            1.0,
+        )
+        node_tail_feature = np.clip(
+            0.70 * node_abs_demand_delta_norm + 0.30 * prev_dist_scalar,
+            0.0,
+            1.0,
+        )
 
     node_feat = np.stack([
         degree_norm,                                                        # 0
@@ -324,9 +406,9 @@ def build_graph_tensors_plus(
         fail_exposure,                                                      # 10
         (in_degree / (out_degree + 1e-12)).clip(0, 5) / 5.0,               # 11
         demand_through_node_norm,                                           # 12 NEW
-        congested_neighbor_frac,                                            # 13 NEW
+        node_neighbor_feature,                                              # 13 NEW
         max_residual_cap_norm,                                              # 14 NEW
-        clustering,                                                         # 15 NEW
+        node_tail_feature,                                                  # 15 NEW
     ], axis=1)[:, :16].astype(np.float32)
 
     node_features = torch.tensor(node_feat, dtype=torch.float32, device=dev)
@@ -343,7 +425,9 @@ def build_graph_tensors_plus(
 
 def build_od_features_plus(
     dataset, tm_vector, path_library,
-    telemetry=None, prev_tm=None,
+    telemetry=None, prev_tm=None, prev_util=None,
+    prev_selected_indicator=None, prev_disturbance=0.0,
+    feature_variant="legacy",
     device="cpu",
 ):
     """Build enhanced per-OD features with 18 dimensions.
@@ -354,12 +438,15 @@ def build_od_features_plus(
       11: demand_change_ratio — tm_t / tm_{t-1}, normalized to [0, 1]
       12: src_congestion — max_util_out of source node
       13: dst_congestion — max_util_in of dest node
-      14: path_overlap_score — fraction of path edges shared with other active ODs
+      14: legacy=path_overlap_score, section3=absolute_bottleneck_delta,
+          section7=blend(absolute_bottleneck_delta, prev_selected)
       15: ecmp_contribution — demand * bottleneck_util / sum(all demands * bottleneck_utils)
       16: alternative_path_headroom — max headroom across non-best paths
-      17: demand_x_hop — demand * hop_count, normalized
+      17: legacy=demand_x_hop, section3=absolute_demand_delta,
+          section7=blend(absolute_demand_delta, prev_disturbance)
     """
     dev = torch.device(device)
+    variant = _normalize_feature_variant(feature_variant)
     cache = _get_plus_topology_cache(dataset, path_library)
     num_od = len(path_library.od_pairs)
     num_edges = len(dataset.edges)
@@ -377,12 +464,16 @@ def build_od_features_plus(
     num_paths = np.asarray(cache["num_paths"], dtype=np.float64).copy()
     bottleneck_util = np.zeros(num_od, dtype=np.float64)
     mean_path_util = np.zeros(num_od, dtype=np.float64)
+    bottleneck_delta_abs = np.zeros(num_od, dtype=np.float64)
     hop_count = np.asarray(cache["hop_count"], dtype=np.float64).copy()
     best_path_edges_list = cache["best_path_edges_list"]
 
     util = np.zeros(num_edges, dtype=np.float64)
     if telemetry is not None:
         util = np.asarray(telemetry.utilization, dtype=np.float64)[:num_edges]
+    prev_util_arr = None
+    if prev_util is not None:
+        prev_util_arr = np.asarray(prev_util, dtype=np.float64)[:num_edges]
 
     # Node-level congestion (for src/dst congestion features)
     max_util_in = np.zeros(num_nodes, dtype=np.float64)
@@ -403,6 +494,9 @@ def build_od_features_plus(
             path_utils = util[np.asarray(path_edges, dtype=np.int64)]
             bottleneck_util[od_idx] = float(np.max(path_utils)) if path_utils.size else 0.0
             mean_path_util[od_idx] = float(np.mean(path_utils)) if path_utils.size else 0.0
+            if prev_util_arr is not None and path_utils.size:
+                prev_path_utils = prev_util_arr[np.asarray(path_edges, dtype=np.int64)]
+                bottleneck_delta_abs[od_idx] = abs(float(np.max(path_utils)) - float(np.max(prev_path_utils)))
 
         for alt_edges in cache["alt_edge_paths"][od_idx]:
             if not alt_edges:
@@ -430,11 +524,13 @@ def build_od_features_plus(
 
     # 11: demand_change_ratio
     demand_change = np.ones(num_od, dtype=np.float64) * 0.5
+    demand_delta_abs = np.zeros(num_od, dtype=np.float64)
     if prev_tm is not None:
         prev = np.asarray(prev_tm, dtype=np.float64)
         ratio = tm / (prev + 1e-12)
         ratio_clipped = np.clip(ratio, 0.5, 2.0)
         demand_change = (ratio_clipped - 0.5) / 1.5  # [0, 1]
+        demand_delta_abs = np.abs(tm - prev)
 
     # 12: src_congestion
     src_congestion = max_util_out[od_src]
@@ -461,6 +557,28 @@ def build_od_features_plus(
     # 17: demand_x_hop
     demand_x_hop = tm * hop_count
     demand_x_hop_norm = demand_x_hop / (np.max(demand_x_hop) + 1e-12)
+    bottleneck_delta_abs_norm = bottleneck_delta_abs / (np.max(bottleneck_delta_abs) + 1e-12)
+    demand_delta_abs_norm = demand_delta_abs / (np.max(demand_delta_abs) + 1e-12)
+    prev_selected = _normalize_prev_selected_indicator(prev_selected_indicator, num_od)
+    prev_dist_scalar = float(np.clip(prev_disturbance, 0.0, 1.0))
+
+    if variant == "legacy":
+        od_stress_feature = path_overlap
+        od_tail_feature = demand_x_hop_norm
+    elif variant == "section3_physical":
+        od_stress_feature = bottleneck_delta_abs_norm
+        od_tail_feature = demand_delta_abs_norm
+    else:
+        od_stress_feature = np.clip(
+            0.70 * bottleneck_delta_abs_norm + 0.30 * prev_selected,
+            0.0,
+            1.0,
+        )
+        od_tail_feature = np.clip(
+            0.70 * demand_delta_abs_norm + 0.30 * prev_dist_scalar,
+            0.0,
+            1.0,
+        )
 
     # Stack all 18 features
     od_feat = np.stack([
@@ -478,10 +596,10 @@ def build_od_features_plus(
         demand_change,         # 11 NEW
         src_congestion,        # 12 NEW
         dst_congestion,        # 13 NEW
-        path_overlap,          # 14 NEW
+        od_stress_feature,     # 14 NEW
         ecmp_contribution,     # 15 NEW
         alt_path_headroom,     # 16 NEW
-        demand_x_hop_norm,     # 17 NEW
+        od_tail_feature,       # 17 NEW
     ], axis=1).astype(np.float32)
 
     bottleneck_scores = tm.astype(np.float32) * bottleneck_util.astype(np.float32)
@@ -513,8 +631,18 @@ class GNNPlusFlowSelector(GNNFlowSelector):
         self._k_min = 15
         self._k_max = 40
 
-    def select_critical_flows(self, graph_data, od_data, active_mask, k_crit_default=40,
-                              path_library=None, telemetry=None, force_default_k=False):
+    def select_critical_flows(
+        self,
+        graph_data,
+        od_data,
+        active_mask,
+        k_crit_default=40,
+        path_library=None,
+        telemetry=None,
+        force_default_k=False,
+        prev_selected_indicator=None,
+        continuity_bonus: float = 0.0,
+    ):
         """Select critical flows with dynamic bounded K.
 
         Key difference from parent: force_default_k defaults to False,
@@ -536,16 +664,30 @@ class GNNPlusFlowSelector(GNNFlowSelector):
             info["k_used"] = 0
             info["k_default"] = k_crit_default
             info["k_dynamic"] = k_pred
+            info["continuity_bonus"] = float(continuity_bonus)
             return [], info
 
         take = min(k, active_indices.size)
         active_scores = scores_np[active_indices]
-        top_local = np.argsort(-active_scores, kind="mergesort")[:take]
+        ranking_scores = active_scores
+        prev_selected = _normalize_prev_selected_indicator(prev_selected_indicator, scores_np.shape[0])
+        if float(continuity_bonus) > 0.0 and prev_selected.size == scores_np.shape[0]:
+            score_span = float(np.max(active_scores) - np.min(active_scores))
+            if score_span > 1e-12:
+                normalized_scores = (active_scores - float(np.min(active_scores))) / score_span
+            else:
+                normalized_scores = np.zeros_like(active_scores)
+            ranking_scores = normalized_scores + float(continuity_bonus) * prev_selected[active_indices]
+        top_local = np.argsort(-ranking_scores, kind="mergesort")[:take]
         selected = [int(active_indices[i]) for i in top_local]
 
         info["k_used"] = take
         info["k_default"] = k_crit_default
         info["k_dynamic"] = k_pred
+        info["continuity_bonus"] = float(continuity_bonus)
+        info["continuity_kept"] = int(
+            sum(1 for od in selected if od < prev_selected.size and prev_selected[od] > 0.5)
+        )
         return selected, info
 
 
@@ -565,6 +707,7 @@ def save_gnn_plus(model: GNNPlusFlowSelector, path, extra_meta=None):
             "learn_k_crit": cfg.learn_k_crit,
             "k_crit_min": cfg.k_crit_min,
             "k_crit_max": cfg.k_crit_max,
+            "feature_variant": cfg.feature_variant,
         },
         "model_type": "gnn_plus",
     }
@@ -582,3 +725,85 @@ def load_gnn_plus(path, device="cpu"):
     model.load_state_dict(payload["state_dict"])
     model.eval()
     return model, cfg
+
+
+def build_graph_tensors_plus_section3(
+    dataset, tm_vector=None, path_library=None,
+    telemetry=None, failure_mask=None,
+    prev_util=None, prev_tm=None,
+    device="cpu",
+):
+    """Section 3 physical/stress-aware GNN+ graph features."""
+    return build_graph_tensors_plus(
+        dataset,
+        tm_vector=tm_vector,
+        path_library=path_library,
+        telemetry=telemetry,
+        failure_mask=failure_mask,
+        prev_util=prev_util,
+        prev_tm=prev_tm,
+        feature_variant="section3_physical",
+        device=device,
+    )
+
+
+def build_od_features_plus_section3(
+    dataset, tm_vector, path_library,
+    telemetry=None, prev_tm=None, prev_util=None,
+    device="cpu",
+):
+    """Section 3 physical/stress-aware GNN+ OD features."""
+    return build_od_features_plus(
+        dataset,
+        tm_vector,
+        path_library,
+        telemetry=telemetry,
+        prev_tm=prev_tm,
+        prev_util=prev_util,
+        feature_variant="section3_physical",
+        device=device,
+    )
+
+
+def build_graph_tensors_plus_section7(
+    dataset, tm_vector=None, path_library=None,
+    telemetry=None, failure_mask=None,
+    prev_util=None, prev_tm=None,
+    prev_selected_indicator=None, prev_disturbance=0.0,
+    device="cpu",
+):
+    """Section 7 temporal/stability-aware GNN+ graph features."""
+    return build_graph_tensors_plus(
+        dataset,
+        tm_vector=tm_vector,
+        path_library=path_library,
+        telemetry=telemetry,
+        failure_mask=failure_mask,
+        prev_util=prev_util,
+        prev_tm=prev_tm,
+        prev_selected_indicator=prev_selected_indicator,
+        prev_disturbance=prev_disturbance,
+        feature_variant="section7_temporal",
+        device=device,
+    )
+
+
+def build_od_features_plus_section7(
+    dataset, tm_vector, path_library,
+    telemetry=None, prev_tm=None, prev_util=None,
+    prev_selected_indicator=None, prev_disturbance=0.0,
+    device="cpu",
+):
+    """Section 7 temporal/stability-aware GNN+ OD features."""
+    return build_od_features_plus(
+        dataset,
+        tm_vector,
+        path_library,
+        telemetry=telemetry,
+        prev_tm=prev_tm,
+        prev_util=prev_util,
+        prev_selected_indicator=prev_selected_indicator,
+        prev_disturbance=prev_disturbance,
+        feature_variant="section7_temporal",
+        device=device,
+    )

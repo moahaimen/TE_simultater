@@ -100,6 +100,15 @@ class ReactiveRoutingEnv:
         self.current_telemetry = telemetry
         return self.current_obs
 
+    def _selection_reroute_mass(self, selected_ods: Sequence[int]) -> float:
+        prev_indicator = np.asarray(self.prev_selected, dtype=np.float32)
+        curr_indicator = np.zeros(len(self.dataset.od_pairs), dtype=np.float32)
+        if selected_ods:
+            curr_indicator[np.asarray(list(selected_ods), dtype=int)] = 1.0
+        switched = float(np.abs(curr_indicator - prev_indicator).sum() / 2.0)
+        normalizer = max(float(curr_indicator.sum()), float(prev_indicator.sum()), 1.0)
+        return switched / normalizer
+
     def step(self, selected_ods: Sequence[int]):
         timestep = int(self._indices[self.pointer])
         tm_vector = self.tm[timestep]
@@ -134,6 +143,7 @@ class ReactiveRoutingEnv:
         )
         feasible = bool(telemetry.dropped_demand_pct <= 1e-9)
         ref_latency = reactive_reference_latency(tm_vector, self.path_library, self.weights)
+        reroute_mass = self._selection_reroute_mass(selected)
         reward, reward_parts = compute_reactive_reward(
             mean_latency=telemetry.mean_latency,
             reference_latency=ref_latency,
@@ -141,6 +151,7 @@ class ReactiveRoutingEnv:
             mlu=routing.mlu,
             jitter=telemetry.jitter,
             disturbance=disturbance,
+            reroute_mass=reroute_mass,
             dropped_demand_pct=telemetry.dropped_demand_pct,
             feasible=feasible,
             cfg=self.cfg.reward,
@@ -187,6 +198,7 @@ class ReactiveRoutingEnv:
             "packet_loss": float(telemetry.packet_loss),
             "dropped_demand_pct": float(telemetry.dropped_demand_pct),
             "disturbance": float(disturbance),
+            "reroute_mass": float(reroute_mass),
             "lp_runtime_sec": float(lp_runtime),
             "status": str(lp.status),
             "k_crit": int(self.k_crit),

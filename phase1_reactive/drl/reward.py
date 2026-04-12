@@ -19,6 +19,7 @@ class ReactiveRewardConfig:
     w_feas: float = 0.1
     w_thr: float = 0.3
     w_jit: float = 0.2
+    w_reroute_mass: float = 0.15
 
 
 def compute_reactive_reward(
@@ -29,6 +30,7 @@ def compute_reactive_reward(
     mlu: float,
     jitter: float,
     disturbance: float,
+    reroute_mass: float = 0.0,
     dropped_demand_pct: float,
     feasible: bool,
     cfg: ReactiveRewardConfig | None = None,
@@ -39,6 +41,7 @@ def compute_reactive_reward(
     throughput_term = float(np.clip(throughput, 0.0, 1.0))
     mlu_term = float(max(mlu, 0.0))
     disturbance_term = float(max(disturbance, 0.0))
+    reroute_mass_term = float(np.clip(reroute_mass, 0.0, 1.0))
     dropped_term = float(np.clip(dropped_demand_pct, 0.0, 1.0))
     infeasibility = 0.0 if feasible else 1.0
     feasibility_bonus = 1.0 if feasible else 0.0
@@ -47,6 +50,7 @@ def compute_reactive_reward(
         -float(cfg.w_mlu) * mlu_term
         -float(cfg.w_delay) * normalized_latency
         -float(cfg.w_dist) * disturbance_term
+        -float(cfg.w_reroute_mass) * reroute_mass_term
         -float(cfg.w_loss) * dropped_term
         -float(cfg.w_fail) * infeasibility
         +float(cfg.w_feas) * feasibility_bonus
@@ -59,6 +63,7 @@ def compute_reactive_reward(
         "reward_mlu": -float(cfg.w_mlu) * mlu_term,
         "reward_delay": -float(cfg.w_delay) * normalized_latency,
         "reward_disturbance": -float(cfg.w_dist) * disturbance_term,
+        "reward_reroute_mass": -float(cfg.w_reroute_mass) * reroute_mass_term,
         "reward_dropped": -float(cfg.w_loss) * dropped_term,
         "reward_infeasibility": -float(cfg.w_fail) * infeasibility,
         "reward_feasible": float(cfg.w_feas) * feasibility_bonus,
@@ -69,6 +74,7 @@ def compute_reactive_reward(
         "throughput_term": throughput_term,
         "mlu_term": mlu_term,
         "disturbance_term": disturbance_term,
+        "reroute_mass_term": reroute_mass_term,
         "dropped_term": dropped_term,
         "feasible": float(feasibility_bonus),
     }

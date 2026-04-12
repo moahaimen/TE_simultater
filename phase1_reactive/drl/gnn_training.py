@@ -41,6 +41,10 @@ class GNNTrainingConfig:
     batch_size: int = 1          # graph-level batching (1 graph per step)
     oracle_margin: float = 0.1   # margin for ranking loss
     reinforce_weight: float = 0.1  # weight for REINFORCE-style LP feedback
+    use_soft_teacher_targets: bool = True
+    soft_teacher_weight: float = 0.35
+    criticality_weight: float = 0.20
+    lp_teacher_weight: float = 2.5
     device: str = "cpu"
     seed: int = 42
 
@@ -54,6 +58,34 @@ class GNNTrainingSummary:
     best_val_loss: float
     final_alpha: float
     final_k_pred_mean: float
+
+
+@dataclass
+class GNNReinforceConfig:
+    lr: float = 1e-4
+    max_epochs: int = 10
+    patience: int = 4
+    baseline_ema: float = 0.9
+    w_reward_mlu: float = 1.0
+    w_reward_improvement: float = 0.8
+    w_reward_disturbance: float = 0.25
+    w_reward_infeasible: float = 2.0
+    w_reward_vs_bottleneck: float = 0.35
+    w_reward_vs_reference: float = 0.20
+    rank_loss_weight: float = 0.25
+    score_margin_weight: float = 0.05
+    infeasible_mlu_penalty: float = 10.0
+
+
+def _rank_scores(indices, num_od: int, weight: float) -> np.ndarray:
+    scores = np.zeros(int(num_od), dtype=np.float32)
+    take = len(indices)
+    if take <= 0:
+        return scores
+    for rank, od_idx in enumerate(indices):
+        if 0 <= int(od_idx) < num_od:
+            scores[int(od_idx)] += float(weight) * float(take - rank) / float(take)
+    return scores
 
 
 def _collect_oracle_labels(
@@ -140,6 +172,236 @@ def _ranking_loss(scores, oracle_mask, margin=0.1):
     return loss + 0.5 * ce_loss
 
 
+def _soft_teacher_loss(
+    scores: torch.Tensor,
+    *,
+    soft_target: torch.Tensor | None = None,
+    criticality: torch.Tensor | None = None,
+    soft_weight: float = 0.35,
+    criticality_weight: float = 0.20,
+) -> torch.Tensor:
+    loss = torch.tensor(0.0, device=scores.device)
+    if soft_target is not None and float(soft_weight) > 0.0:
+        target = soft_target.float()
+        target_sum = torch.sum(target)
+        if float(target_sum.item()) > 0.0:
+            target = target / target_sum
+            log_probs = F.log_softmax(scores, dim=0)
+            kl = F.kl_div(log_probs, target, reduction="batchmean")
+            loss = loss + float(soft_weight) * kl
+    if criticality is not None and float(criticality_weight) > 0.0:
+        crit = criticality.float()
+        crit_max = torch.max(crit)
+        if float(crit_max.item()) > 0.0:
+            crit = crit / crit_max
+            mse = F.mse_loss(torch.sigmoid(scores), crit)
+            loss = loss + float(criticality_weight) * mse
+    return loss
+
+
+def _score_margin_regularizer(scores: torch.Tensor, active_mask: np.ndarray, k: int) -> torch.Tensor:
+    active = np.asarray(active_mask, dtype=bool)
+    active_idx = np.where(active)[0]
+    if active_idx.size == 0:
+        return torch.tensor(0.0, device=scores.device)
+    take = min(int(k), int(active_idx.size))
+    if take <= 0 or take >= int(active_idx.size):
+        return torch.tensor(0.0, device=scores.device)
+    active_scores = scores[torch.tensor(active_idx, dtype=torch.long, device=scores.device)]
+    top_vals, _ = torch.topk(active_scores, take)
+    kth_val = top_vals[-1]
+    non_selected_mask = torch.ones(active_scores.shape[0], dtype=torch.bool, device=scores.device)
+    top_idx = torch.topk(active_scores, take).indices
+    non_selected_mask[top_idx] = False
+    if not bool(torch.any(non_selected_mask)):
+        return torch.tensor(0.0, device=scores.device)
+    best_other = torch.max(active_scores[non_selected_mask])
+    margin = kth_val - best_other
+    return -margin
+
+
+def _select_topk_from_scores(scores: torch.Tensor, active_mask: np.ndarray, k: int) -> list[int]:
+    active = np.asarray(active_mask, dtype=bool)
+    active_idx = np.where(active)[0]
+    if active_idx.size == 0:
+        return []
+    take = min(int(k), int(active_idx.size))
+    active_scores = scores[torch.tensor(active_idx, dtype=torch.long, device=scores.device)]
+    _, top_local = torch.topk(active_scores, take)
+    return [int(active_idx[i]) for i in top_local.detach().cpu().numpy()]
+
+
+def _run_selected_lp(
+    *,
+    tm_vector: np.ndarray,
+    selected_ods: list[int],
+    ecmp_base,
+    path_library,
+    capacities,
+    time_limit_sec: int,
+):
+    from te.lp_solver import solve_selected_path_lp
+    from te.simulator import apply_routing
+
+    lp = solve_selected_path_lp(
+        tm_vector=tm_vector,
+        selected_ods=selected_ods,
+        base_splits=ecmp_base,
+        path_library=path_library,
+        capacities=capacities,
+        time_limit_sec=time_limit_sec,
+    )
+    routing = apply_routing(tm_vector, lp.splits, path_library, capacities)
+    return lp, routing
+
+
+def _bottleneck_baseline_mlu(*, tm_vector: np.ndarray, ecmp_base, path_library, capacities, k_crit: int, time_limit_sec: int) -> float:
+    from te.baselines import select_bottleneck_critical
+
+    selected = select_bottleneck_critical(tm_vector, ecmp_base, path_library, capacities, k_crit)
+    _, routing = _run_selected_lp(
+        tm_vector=tm_vector,
+        selected_ods=selected,
+        ecmp_base=ecmp_base,
+        path_library=path_library,
+        capacities=capacities,
+        time_limit_sec=time_limit_sec,
+    )
+    return float(routing.mlu)
+
+
+def _reference_model_mlu(
+    *,
+    reference_model,
+    dataset,
+    path_library,
+    tm_vector: np.ndarray,
+    telemetry,
+    ecmp_base,
+    capacities,
+    k_crit: int,
+    device: str,
+    time_limit_sec: int,
+):
+    if reference_model is None:
+        return None
+    graph_data = build_graph_tensors(dataset, telemetry=telemetry, device=device)
+    od_data = build_od_features(dataset, tm_vector, path_library, telemetry=telemetry, device=device)
+    selected, _ = reference_model.select_critical_flows(
+        graph_data,
+        od_data,
+        active_mask=(tm_vector > 0),
+        k_crit_default=k_crit,
+    )
+    _, routing = _run_selected_lp(
+        tm_vector=tm_vector,
+        selected_ods=selected,
+        ecmp_base=ecmp_base,
+        path_library=path_library,
+        capacities=capacities,
+        time_limit_sec=time_limit_sec,
+    )
+    return float(routing.mlu)
+
+
+def _normalize_positive(scores: np.ndarray) -> np.ndarray:
+    scores = np.asarray(scores, dtype=np.float64)
+    scores = np.maximum(scores, 0.0)
+    total = float(np.sum(scores))
+    if total <= 1e-12:
+        return np.zeros_like(scores, dtype=np.float32)
+    return (scores / total).astype(np.float32)
+
+
+def _continuous_criticality(scores: np.ndarray) -> np.ndarray:
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    scores = np.maximum(scores, 0.0)
+    vmax = float(np.max(scores))
+    if vmax <= 1e-12:
+        return np.zeros(scores.size, dtype=np.float32)
+    return np.power(scores / vmax, 0.75).astype(np.float32)
+
+
+def _soft_topk_targets(scores: np.ndarray, k_crit: int) -> np.ndarray:
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    take = min(int(k_crit), int(scores.size))
+    if take <= 0:
+        return np.zeros(scores.size, dtype=np.float32)
+    order = np.argsort(-scores)[:take]
+    top_scores = np.maximum(scores[order], 0.0)
+    if float(np.sum(top_scores)) <= 1e-12:
+        top_scores = np.linspace(float(take), 1.0, take, dtype=np.float64)
+    soft = np.zeros(scores.size, dtype=np.float32)
+    soft[order] = _normalize_positive(top_scores)
+    return soft
+
+
+def _collect_soft_teacher_targets(
+    *,
+    dataset,
+    path_library,
+    tm_vector,
+    ecmp_base,
+    capacities,
+    k_crit,
+    lp_time_limit_sec=20,
+    lp_teacher_weight: float = 2.5,
+):
+    from te.baselines import select_bottleneck_critical, select_sensitivity_critical, select_topk_by_demand
+    from te.lp_solver import solve_full_mcf_min_mlu
+
+    num_od = len(dataset.od_pairs)
+    topk_idx = select_topk_by_demand(tm_vector, k_crit)
+    bottleneck_idx = select_bottleneck_critical(tm_vector, ecmp_base, path_library, capacities, k_crit)
+    sensitivity_idx = select_sensitivity_critical(tm_vector, ecmp_base, path_library, capacities, k_crit)
+
+    teacher_scores = (
+        _rank_scores(topk_idx, num_od, 1.0)
+        + _rank_scores(bottleneck_idx, num_od, 1.2)
+        + _rank_scores(sensitivity_idx, num_od, 1.2)
+    )
+
+    source = str(dataset.metadata.get("phase1_source", dataset.metadata.get("source", "unknown"))).lower()
+    if source == "sndlib":
+        try:
+            full = solve_full_mcf_min_mlu(
+                tm_vector=tm_vector,
+                od_pairs=dataset.od_pairs,
+                nodes=dataset.nodes,
+                edges=dataset.edges,
+                capacities=dataset.capacities,
+                time_limit_sec=int(lp_time_limit_sec),
+            )
+            if np.isfinite(float(full.mlu)):
+                from te.baselines import project_edge_flows_to_k_path_splits
+                projected = project_edge_flows_to_k_path_splits(full.edge_flows_by_od, path_library)
+                lp_scores = np.zeros(num_od, dtype=np.float32)
+                for od_idx in range(num_od):
+                    base = np.asarray(ecmp_base[od_idx], dtype=float)
+                    proj = np.asarray(projected[od_idx], dtype=float)
+                    if base.size == 0 or proj.size != base.size:
+                        continue
+                    mass_base = float(base.sum())
+                    mass_proj = float(proj.sum())
+                    if mass_base > 1e-12:
+                        base = base / mass_base
+                    if mass_proj > 1e-12:
+                        proj = proj / mass_proj
+                    lp_scores[od_idx] = float(0.5 * np.abs(proj - base).sum())
+                if float(lp_scores.sum()) > 0.0:
+                    teacher_scores += float(lp_teacher_weight) * lp_scores
+        except Exception:
+            pass
+
+    soft_teacher = _soft_topk_targets(teacher_scores, k_crit)
+    continuous_criticality = _continuous_criticality(teacher_scores)
+    return soft_teacher, continuous_criticality
+
+
 def train_gnn_selector(
     *,
     train_datasets: list[tuple],   # list of (dataset, path_library) tuples
@@ -202,6 +464,17 @@ def train_gnn_selector(
             if not oracle_selected:
                 continue
 
+            soft_teacher, continuous_criticality = _collect_soft_teacher_targets(
+                dataset=dataset,
+                path_library=path_library,
+                tm_vector=tm_vector,
+                ecmp_base=ecmp_base,
+                capacities=capacities,
+                k_crit=k_crit,
+                lp_time_limit_sec=20,
+                lp_teacher_weight=train_cfg.lp_teacher_weight,
+            )
+
             topo_count += 1
             train_samples.append({
                 "dataset": dataset,
@@ -210,6 +483,8 @@ def train_gnn_selector(
                 "telemetry": telemetry,
                 "oracle_selected": oracle_selected,
                 "oracle_mlu": oracle_mlu,
+                "soft_teacher": soft_teacher,
+                "continuous_criticality": continuous_criticality,
                 "k_crit": k_crit,
                 "capacities": capacities,
             })
@@ -238,6 +513,16 @@ def train_gnn_selector(
             )
             if not oracle_selected:
                 continue
+            soft_teacher, continuous_criticality = _collect_soft_teacher_targets(
+                dataset=dataset,
+                path_library=path_library,
+                tm_vector=tm_vector,
+                ecmp_base=ecmp_base,
+                capacities=capacities,
+                k_crit=k_crit,
+                lp_time_limit_sec=20,
+                lp_teacher_weight=train_cfg.lp_teacher_weight,
+            )
             val_samples.append({
                 "dataset": dataset,
                 "path_library": path_library,
@@ -245,6 +530,8 @@ def train_gnn_selector(
                 "telemetry": telemetry,
                 "oracle_selected": oracle_selected,
                 "oracle_mlu": oracle_mlu,
+                "soft_teacher": soft_teacher,
+                "continuous_criticality": continuous_criticality,
                 "k_crit": k_crit,
                 "capacities": capacities,
             })
@@ -285,6 +572,16 @@ def train_gnn_selector(
                     oracle_mask[oid] = 1.0
 
             loss = _ranking_loss(scores, oracle_mask, margin=train_cfg.oracle_margin)
+            if train_cfg.use_soft_teacher_targets:
+                soft_target = torch.tensor(sample["soft_teacher"], dtype=torch.float32, device=device)
+                criticality = torch.tensor(sample["continuous_criticality"], dtype=torch.float32, device=device)
+                loss = loss + _soft_teacher_loss(
+                    scores,
+                    soft_target=soft_target,
+                    criticality=criticality,
+                    soft_weight=train_cfg.soft_teacher_weight,
+                    criticality_weight=train_cfg.criticality_weight,
+                )
 
             # k_crit loss (if learning k)
             if k_pred is not None:
@@ -326,6 +623,16 @@ def train_gnn_selector(
                         oracle_mask[oid] = 1.0
 
                 vloss = _ranking_loss(scores, oracle_mask, margin=train_cfg.oracle_margin)
+                if train_cfg.use_soft_teacher_targets:
+                    soft_target = torch.tensor(sample["soft_teacher"], dtype=torch.float32, device=device)
+                    criticality = torch.tensor(sample["continuous_criticality"], dtype=torch.float32, device=device)
+                    vloss = vloss + _soft_teacher_loss(
+                        scores,
+                        soft_target=soft_target,
+                        criticality=criticality,
+                        soft_weight=train_cfg.soft_teacher_weight,
+                        criticality_weight=train_cfg.criticality_weight,
+                    )
                 val_losses.append(float(vloss.item()))
 
                 # Compute selection overlap with oracle
@@ -395,6 +702,13 @@ def train_gnn_selector(
             "edge_dim": gnn_cfg.edge_dim,
             "od_dim": gnn_cfg.od_dim,
             "learn_k_crit": gnn_cfg.learn_k_crit,
+            "feature_variant": getattr(gnn_cfg, "feature_variant", "legacy"),
+        },
+        "teacher_supervision": {
+            "use_soft_teacher_targets": bool(train_cfg.use_soft_teacher_targets),
+            "soft_teacher_weight": float(train_cfg.soft_teacher_weight),
+            "criticality_weight": float(train_cfg.criticality_weight),
+            "lp_teacher_weight": float(train_cfg.lp_teacher_weight),
         },
     }
     (out_dir / "gnn_train_summary.json").write_text(
@@ -425,10 +739,8 @@ def reinforce_finetune_gnn(
     train_samples: list[dict],
     val_samples: list[dict],
     output_dir: Path | str,
-    lr: float = 1e-4,
-    max_epochs: int = 10,
-    patience: int = 4,
-    baseline_ema: float = 0.9,
+    rl_cfg: GNNReinforceConfig | None = None,
+    reference_model=None,
     seed: int = 42,
 ) -> GNNTrainingSummary:
     """REINFORCE fine-tuning: use actual LP MLU as reward signal.
@@ -438,16 +750,18 @@ def reinforce_finetune_gnn(
     For each sample:
       1. GNN scores ODs → sample top-k (with Gumbel-softmax for differentiability)
       2. Run LP with selected ODs → get MLU
-      3. Reward = -MLU (lower is better)
+      3. Reward combines MLU, improvement over ECMP, disturbance, and baseline wins
       4. REINFORCE gradient: grad = (reward - baseline) * grad(log_prob)
     """
-    from te.lp_solver import solve_selected_path_lp
     from te.baselines import ecmp_splits
+    from te.disturbance import compute_disturbance
+    from te.simulator import apply_routing
 
     out_dir = Path(output_dir)
     device = gnn_cfg.device
+    rl_cfg = rl_cfg or GNNReinforceConfig()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(rl_cfg.lr))
     rng = np.random.default_rng(seed)
 
     baseline_reward = None
@@ -457,14 +771,18 @@ def reinforce_finetune_gnn(
     logs = []
     start_time = time.perf_counter()
 
-    print(f"[REINFORCE] Fine-tuning on {len(train_samples)} samples, max {max_epochs} epochs", flush=True)
+    print(f"[REINFORCE] Fine-tuning on {len(train_samples)} samples, max {rl_cfg.max_epochs} epochs", flush=True)
 
-    for epoch in range(1, max_epochs + 1):
+    for epoch in range(1, int(rl_cfg.max_epochs) + 1):
         epoch_start = time.perf_counter()
         model.train()
         order = rng.permutation(len(train_samples))
         epoch_rewards = []
         epoch_mlu = []
+        epoch_improvement = []
+        epoch_vs_bn = []
+        epoch_vs_ref = []
+        epoch_dist = []
 
         for sample_idx in order:
             sample = train_samples[sample_idx]
@@ -489,16 +807,16 @@ def reinforce_finetune_gnn(
             active_scores = scores[torch.tensor(active_idx, dtype=torch.long, device=device)]
             log_probs = F.log_softmax(active_scores, dim=0)
 
-            # Select top-k by score (deterministic for LP, use log_probs for gradient)
             take = min(k, active_idx.size)
             _, top_local = torch.topk(active_scores, take)
-            selected_ods = [int(active_idx[i]) for i in top_local.cpu().numpy()]
+            selected_ods = [int(active_idx[i]) for i in top_local.detach().cpu().numpy()]
             selected_log_prob = log_probs[top_local].sum()
 
-            # Run LP with selected ODs
             ecmp_base = ecmp_splits(sample["path_library"])
+            ecmp_routing = apply_routing(sample["tm_vector"], ecmp_base, sample["path_library"], sample["capacities"])
+            ecmp_mlu = float(ecmp_routing.mlu)
             try:
-                lp = solve_selected_path_lp(
+                lp, routing = _run_selected_lp(
                     tm_vector=sample["tm_vector"],
                     selected_ods=selected_ods,
                     base_splits=ecmp_base,
@@ -506,23 +824,75 @@ def reinforce_finetune_gnn(
                     capacities=sample["capacities"],
                     time_limit_sec=10,
                 )
-                mlu = float(lp.routing.mlu)
+                mlu = float(routing.mlu)
+                feasible = bool(np.isfinite(mlu))
             except Exception:
-                continue
+                feasible = False
+                mlu = float(rl_cfg.infeasible_mlu_penalty)
+                lp = None
+                routing = None
 
             if not np.isfinite(mlu):
-                continue
+                feasible = False
+                mlu = float(rl_cfg.infeasible_mlu_penalty)
 
-            # Reward = negative MLU (lower MLU is better)
-            reward = -mlu
+            disturbance = 0.0
+            if feasible and lp is not None:
+                disturbance = float(compute_disturbance(ecmp_base, lp.splits, sample["tm_vector"]))
+
+            improvement = (ecmp_mlu - mlu) / max(abs(ecmp_mlu), 1e-12)
+            try:
+                bottleneck_mlu = _bottleneck_baseline_mlu(
+                    tm_vector=sample["tm_vector"],
+                    ecmp_base=ecmp_base,
+                    path_library=sample["path_library"],
+                    capacities=sample["capacities"],
+                    k_crit=k,
+                    time_limit_sec=10,
+                )
+            except Exception:
+                bottleneck_mlu = None
+            ref_mlu = None
+            if reference_model is not None:
+                try:
+                    ref_mlu = _reference_model_mlu(
+                        reference_model=reference_model,
+                        dataset=sample["dataset"],
+                        path_library=sample["path_library"],
+                        tm_vector=sample["tm_vector"],
+                        telemetry=sample["telemetry"],
+                        ecmp_base=ecmp_base,
+                        capacities=sample["capacities"],
+                        k_crit=k,
+                        device=device,
+                        time_limit_sec=10,
+                    )
+                except Exception:
+                    ref_mlu = None
+
+            vs_bn = 0.0 if bottleneck_mlu is None else (bottleneck_mlu - mlu) / max(abs(bottleneck_mlu), 1e-12)
+            vs_ref = 0.0 if ref_mlu is None else (ref_mlu - mlu) / max(abs(ref_mlu), 1e-12)
+
+            reward = (
+                -float(rl_cfg.w_reward_mlu) * float(mlu)
+                + float(rl_cfg.w_reward_improvement) * float(improvement)
+                - float(rl_cfg.w_reward_disturbance) * float(max(disturbance, 0.0))
+                + float(rl_cfg.w_reward_vs_bottleneck) * float(vs_bn)
+                + float(rl_cfg.w_reward_vs_reference) * float(vs_ref)
+                - (0.0 if feasible else float(rl_cfg.w_reward_infeasible))
+            )
             epoch_rewards.append(reward)
             epoch_mlu.append(mlu)
+            epoch_improvement.append(improvement)
+            epoch_vs_bn.append(vs_bn)
+            epoch_vs_ref.append(vs_ref)
+            epoch_dist.append(disturbance)
 
             # Update baseline (exponential moving average)
             if baseline_reward is None:
                 baseline_reward = reward
             else:
-                baseline_reward = baseline_ema * baseline_reward + (1 - baseline_ema) * reward
+                baseline_reward = float(rl_cfg.baseline_ema) * baseline_reward + (1 - float(rl_cfg.baseline_ema)) * reward
 
             # REINFORCE loss
             advantage = reward - baseline_reward
@@ -534,7 +904,12 @@ def reinforce_finetune_gnn(
                 if oid < scores.size(0):
                     oracle_mask[oid] = 1.0
             rank_loss = _ranking_loss(scores, oracle_mask, margin=0.05)
-            total_loss = loss + 0.3 * rank_loss
+            confidence_loss = _score_margin_regularizer(scores, sample["tm_vector"] > 0, k)
+            total_loss = (
+                loss
+                + float(rl_cfg.rank_loss_weight) * rank_loss
+                + float(rl_cfg.score_margin_weight) * confidence_loss
+            )
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -543,10 +918,16 @@ def reinforce_finetune_gnn(
 
         mean_reward = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
         mean_mlu = float(np.mean(epoch_mlu)) if epoch_mlu else float("inf")
+        mean_improvement = float(np.mean(epoch_improvement)) if epoch_improvement else 0.0
+        mean_vs_bn = float(np.mean(epoch_vs_bn)) if epoch_vs_bn else 0.0
+        mean_vs_ref = float(np.mean(epoch_vs_ref)) if epoch_vs_ref else 0.0
+        mean_dist = float(np.mean(epoch_dist)) if epoch_dist else 0.0
 
         # Validation: run LP on val samples
         model.eval()
         val_mlus = []
+        val_improvement = []
+        val_vs_bn = []
         with torch.no_grad():
             for sample in val_samples:
                 graph_data = build_graph_tensors(
@@ -562,14 +943,12 @@ def reinforce_finetune_gnn(
                 active_idx = np.where(active)[0]
                 if active_idx.size == 0:
                     continue
-                active_scores = scores[torch.tensor(active_idx, dtype=torch.long, device=device)]
-                take = min(k, active_idx.size)
-                _, top_local = torch.topk(active_scores, take)
-                selected_ods = [int(active_idx[i]) for i in top_local.cpu().numpy()]
+                selected_ods = _select_topk_from_scores(scores, active, k)
 
                 ecmp_base = ecmp_splits(sample["path_library"])
+                ecmp_routing = apply_routing(sample["tm_vector"], ecmp_base, sample["path_library"], sample["capacities"])
                 try:
-                    lp = solve_selected_path_lp(
+                    _, routing = _run_selected_lp(
                         tm_vector=sample["tm_vector"],
                         selected_ods=selected_ods,
                         base_splits=ecmp_base,
@@ -577,7 +956,21 @@ def reinforce_finetune_gnn(
                         capacities=sample["capacities"],
                         time_limit_sec=10,
                     )
-                    val_mlus.append(float(lp.routing.mlu))
+                    model_mlu = float(routing.mlu)
+                    val_mlus.append(model_mlu)
+                    val_improvement.append((float(ecmp_routing.mlu) - model_mlu) / max(abs(float(ecmp_routing.mlu)), 1e-12))
+                    try:
+                        bn_mlu = _bottleneck_baseline_mlu(
+                            tm_vector=sample["tm_vector"],
+                            ecmp_base=ecmp_base,
+                            path_library=sample["path_library"],
+                            capacities=sample["capacities"],
+                            k_crit=k,
+                            time_limit_sec=10,
+                        )
+                        val_vs_bn.append((bn_mlu - model_mlu) / max(abs(bn_mlu), 1e-12))
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -589,6 +982,12 @@ def reinforce_finetune_gnn(
             "train_mean_mlu": mean_mlu,
             "val_mean_mlu": val_mlu,
             "mean_reward": mean_reward,
+            "train_mean_improvement_vs_ecmp": mean_improvement,
+            "train_mean_vs_bottleneck": mean_vs_bn,
+            "train_mean_vs_reference": mean_vs_ref,
+            "train_mean_disturbance": mean_dist,
+            "val_mean_improvement_vs_ecmp": float(np.mean(val_improvement)) if val_improvement else 0.0,
+            "val_mean_vs_bottleneck": float(np.mean(val_vs_bn)) if val_vs_bn else 0.0,
             "alpha": float(model.alpha.item()),
             "epoch_time_sec": epoch_time,
         })
@@ -607,7 +1006,7 @@ def reinforce_finetune_gnn(
         else:
             stale += 1
 
-        if stale >= patience:
+        if stale >= int(rl_cfg.patience):
             print(f"  REINFORCE early stopping at epoch {epoch}", flush=True)
             break
 
@@ -616,6 +1015,32 @@ def reinforce_finetune_gnn(
     # Save logs
     log_df = pd.DataFrame(logs)
     log_df.to_csv(out_dir / "reinforce_log.csv", index=False)
+    (out_dir / "reinforce_summary.json").write_text(
+        json.dumps(
+            {
+                "reinforce_config": {
+                    "lr": float(rl_cfg.lr),
+                    "max_epochs": int(rl_cfg.max_epochs),
+                    "patience": int(rl_cfg.patience),
+                    "baseline_ema": float(rl_cfg.baseline_ema),
+                    "w_reward_mlu": float(rl_cfg.w_reward_mlu),
+                    "w_reward_improvement": float(rl_cfg.w_reward_improvement),
+                    "w_reward_disturbance": float(rl_cfg.w_reward_disturbance),
+                    "w_reward_infeasible": float(rl_cfg.w_reward_infeasible),
+                    "w_reward_vs_bottleneck": float(rl_cfg.w_reward_vs_bottleneck),
+                    "w_reward_vs_reference": float(rl_cfg.w_reward_vs_reference),
+                    "rank_loss_weight": float(rl_cfg.rank_loss_weight),
+                    "score_margin_weight": float(rl_cfg.score_margin_weight),
+                },
+                "reference_model_used": bool(reference_model is not None),
+                "best_epoch": int(best_epoch),
+                "best_val_mlu": float(best_val_mlu),
+                "training_time_sec": float(total_time),
+            },
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
 
     return GNNTrainingSummary(
         checkpoint=out_dir / "gnn_selector.pt",

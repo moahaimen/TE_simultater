@@ -159,6 +159,45 @@ def _topk_indices(scores: np.ndarray, k_crit: int) -> list[int]:
     return [int(x) for x in order.tolist()]
 
 
+def _normalize_positive(scores: np.ndarray) -> np.ndarray:
+    scores = np.asarray(scores, dtype=np.float64)
+    scores = np.maximum(scores, 0.0)
+    total = float(np.sum(scores))
+    if total <= EPS:
+        return np.zeros_like(scores, dtype=np.float32)
+    return (scores / total).astype(np.float32)
+
+
+def _soft_topk_targets(scores: np.ndarray, k_crit: int) -> np.ndarray:
+    """Convert teacher scores into a sparse-but-soft OD importance target."""
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    take = min(int(k_crit), int(scores.size))
+    if take <= 0:
+        return np.zeros(scores.size, dtype=np.float32)
+    order = np.argsort(-scores)[:take]
+    top_scores = np.maximum(scores[order], 0.0)
+    if float(np.sum(top_scores)) <= EPS:
+        top_scores = np.linspace(float(take), 1.0, take, dtype=np.float64)
+    soft = np.zeros(scores.size, dtype=np.float32)
+    soft[order] = _normalize_positive(top_scores)
+    return soft
+
+
+def _continuous_criticality(scores: np.ndarray) -> np.ndarray:
+    """Dense OD criticality target in [0, 1] from mixed heuristic/LP teacher scores."""
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    scores = np.maximum(scores, 0.0)
+    vmax = float(np.max(scores))
+    if vmax <= EPS:
+        return np.zeros(scores.size, dtype=np.float32)
+    criticality = np.power(scores / vmax, 0.75)
+    return criticality.astype(np.float32)
+
+
 def build_teacher_dataset(
     *,
     bundle,
@@ -174,7 +213,7 @@ def build_teacher_dataset(
 ) -> TeacherDataSummary:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    heuristic_weights = heuristic_weights or {"topk": 1.0, "bottleneck": 1.2, "sensitivity": 1.2, "lp_opt": 1.5}
+    heuristic_weights = heuristic_weights or {"topk": 1.0, "bottleneck": 1.2, "sensitivity": 1.2, "lp_opt": 2.5}
     summary_rows = []
     total_samples = 0
 
@@ -207,6 +246,8 @@ def build_teacher_dataset(
             active_rows = []
             teacher_score_rows = []
             teacher_label_rows = []
+            teacher_soft_rows = []
+            teacher_criticality_rows = []
             teacher_feature_rows = []
             timestep_rows = []
             lp_teacher_solved = 0
@@ -271,12 +312,16 @@ def build_teacher_dataset(
                 teacher_labels = np.zeros(len(dataset.od_pairs), dtype=np.float32)
                 if teacher_selected:
                     teacher_labels[np.asarray(teacher_selected, dtype=int)] = 1.0
+                teacher_soft = _soft_topk_targets(teacher_scores, env_cfg.k_crit)
+                teacher_criticality = _continuous_criticality(teacher_scores)
 
                 model_od_rows.append(np.asarray(obs.od_features, dtype=np.float32))
                 model_global_rows.append(np.asarray(obs.global_features, dtype=np.float32))
                 active_rows.append(np.asarray(obs.active_mask, dtype=bool))
                 teacher_score_rows.append(np.asarray(teacher_scores, dtype=np.float32))
                 teacher_label_rows.append(teacher_labels)
+                teacher_soft_rows.append(teacher_soft)
+                teacher_criticality_rows.append(teacher_criticality)
                 teacher_feature_rows.append(teacher_features)
                 timestep_rows.append(int(timestep))
 
@@ -300,7 +345,7 @@ def build_teacher_dataset(
                     cfg=env_cfg.telemetry,
                 )
                 prev_splits = clone_splits(lp.splits)
-                prev_selected = teacher_labels.astype(np.float32, copy=True)
+                prev_selected = teacher_soft.astype(np.float32, copy=True)
                 prev_disturbance = float(disturbance)
                 prev_latency_by_od = post_telemetry.latency_by_od
                 prev_mlu = float(post_routing.mlu)
@@ -312,6 +357,8 @@ def build_teacher_dataset(
                 "active_mask": np.stack(active_rows).astype(bool),
                 "teacher_scores": np.stack(teacher_score_rows).astype(np.float32),
                 "teacher_labels": np.stack(teacher_label_rows).astype(np.float32),
+                "teacher_soft_labels": np.stack(teacher_soft_rows).astype(np.float32),
+                "teacher_criticality": np.stack(teacher_criticality_rows).astype(np.float32),
                 "teacher_od_features": np.stack(teacher_feature_rows).astype(np.float32),
                 "timesteps": np.asarray(timestep_rows, dtype=np.int32),
                 "od_src": np.asarray([src for src, _ in dataset.od_pairs], dtype=object),
@@ -329,6 +376,7 @@ def build_teacher_dataset(
                     "model_od_dim": int(payload["model_od_features"].shape[-1]),
                     "model_global_dim": int(payload["model_global_features"].shape[-1]),
                     "teacher_od_dim": int(payload["teacher_od_features"].shape[-1]),
+                    "teacher_supervision": "soft_topk+continuous_criticality",
                     "lp_teacher_solved_steps": int(lp_teacher_solved),
                     "teacher_file": str(file_path),
                 }
