@@ -42,9 +42,9 @@ class GNNTrainingConfig:
     oracle_margin: float = 0.1   # margin for ranking loss
     reinforce_weight: float = 0.1  # weight for REINFORCE-style LP feedback
     use_soft_teacher_targets: bool = True
-    soft_teacher_weight: float = 0.35
-    criticality_weight: float = 0.20
-    lp_teacher_weight: float = 2.5
+    soft_teacher_weight: float = 0.45
+    criticality_weight: float = 0.25
+    lp_teacher_weight: float = 4.0
     device: str = "cpu"
     seed: int = 42
 
@@ -66,14 +66,15 @@ class GNNReinforceConfig:
     max_epochs: int = 10
     patience: int = 4
     baseline_ema: float = 0.9
-    w_reward_mlu: float = 1.0
-    w_reward_improvement: float = 0.8
-    w_reward_disturbance: float = 0.25
+    w_reward_mlu: float = 1.15
+    w_reward_improvement: float = 0.85
+    w_reward_disturbance: float = 0.15
     w_reward_infeasible: float = 2.0
-    w_reward_vs_bottleneck: float = 0.35
-    w_reward_vs_reference: float = 0.20
+    w_reward_vs_bottleneck: float = 0.45
+    w_reward_vs_reference: float = 0.15
+    w_reward_bottleneck_margin: float = 0.10
     rank_loss_weight: float = 0.25
-    score_margin_weight: float = 0.05
+    score_margin_weight: float = 0.08
     infeasible_mlu_penalty: float = 10.0
 
 
@@ -340,6 +341,19 @@ def _soft_topk_targets(scores: np.ndarray, k_crit: int) -> np.ndarray:
     return soft
 
 
+def _lp_guided_teacher_scores(lp_scores: np.ndarray, tm_vector: np.ndarray) -> np.ndarray:
+    lp = np.maximum(np.asarray(lp_scores, dtype=np.float64), 0.0)
+    if lp.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    lp_max = float(np.max(lp))
+    if lp_max <= 1e-12:
+        return np.zeros(lp.shape[0], dtype=np.float32)
+    lp_norm = lp / lp_max
+    demand = np.maximum(np.asarray(tm_vector, dtype=np.float64), 0.0)
+    demand_norm = demand / max(float(np.max(demand)), 1e-12)
+    return (0.75 * lp_norm + 0.25 * (lp_norm * demand_norm)).astype(np.float32)
+
+
 def _collect_soft_teacher_targets(
     *,
     dataset,
@@ -360,9 +374,9 @@ def _collect_soft_teacher_targets(
     sensitivity_idx = select_sensitivity_critical(tm_vector, ecmp_base, path_library, capacities, k_crit)
 
     teacher_scores = (
-        _rank_scores(topk_idx, num_od, 1.0)
-        + _rank_scores(bottleneck_idx, num_od, 1.2)
-        + _rank_scores(sensitivity_idx, num_od, 1.2)
+        _rank_scores(topk_idx, num_od, 0.9)
+        + _rank_scores(bottleneck_idx, num_od, 1.15)
+        + _rank_scores(sensitivity_idx, num_od, 1.0)
     )
 
     source = str(dataset.metadata.get("phase1_source", dataset.metadata.get("source", "unknown"))).lower()
@@ -393,7 +407,7 @@ def _collect_soft_teacher_targets(
                         proj = proj / mass_proj
                     lp_scores[od_idx] = float(0.5 * np.abs(proj - base).sum())
                 if float(lp_scores.sum()) > 0.0:
-                    teacher_scores += float(lp_teacher_weight) * lp_scores
+                    teacher_scores += float(lp_teacher_weight) * _lp_guided_teacher_scores(lp_scores, tm_vector)
         except Exception:
             pass
 
@@ -878,6 +892,7 @@ def reinforce_finetune_gnn(
                 + float(rl_cfg.w_reward_improvement) * float(improvement)
                 - float(rl_cfg.w_reward_disturbance) * float(max(disturbance, 0.0))
                 + float(rl_cfg.w_reward_vs_bottleneck) * float(vs_bn)
+                + float(rl_cfg.w_reward_bottleneck_margin) * float(max(vs_bn, 0.0))
                 + float(rl_cfg.w_reward_vs_reference) * float(vs_ref)
                 - (0.0 if feasible else float(rl_cfg.w_reward_infeasible))
             )
@@ -1028,6 +1043,7 @@ def reinforce_finetune_gnn(
                     "w_reward_disturbance": float(rl_cfg.w_reward_disturbance),
                     "w_reward_infeasible": float(rl_cfg.w_reward_infeasible),
                     "w_reward_vs_bottleneck": float(rl_cfg.w_reward_vs_bottleneck),
+                    "w_reward_bottleneck_margin": float(rl_cfg.w_reward_bottleneck_margin),
                     "w_reward_vs_reference": float(rl_cfg.w_reward_vs_reference),
                     "rank_loss_weight": float(rl_cfg.rank_loss_weight),
                     "score_margin_weight": float(rl_cfg.score_margin_weight),

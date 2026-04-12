@@ -1,16 +1,15 @@
-"""GNN+ enhanced critical flow selector — screening extension.
+"""GNN+ enhanced critical flow selector.
 
 Upgrades over the original GNN selector (gnn_selector.py):
   1. Richer node features: fills 4 placeholder zeros with real features
-  2. Richer edge features: 8 → 12 dimensions (+4 new)
-  3. Richer OD features: 10 → 18 dimensions (+8 new)
-  4. Dynamic bounded K: K = max(15, min(K_pred, 40))
+  2. Richer edge features: 8 -> 12 dimensions (+4 new)
+  3. Richer OD features: 10 -> 18 dimensions (+8 new)
+  4. Config-driven K bounds instead of hardcoded internal limits
+  5. Failure-aware OD features for zero-shot/failure evaluation
 
 This file does NOT modify the original gnn_selector.py.
 It imports the original model class and provides new feature builders
 plus a thin wrapper that adjusts input dimensions.
-
-Created as part of gnn-plus-extension branch.
 """
 
 from __future__ import annotations
@@ -427,6 +426,7 @@ def build_od_features_plus(
     dataset, tm_vector, path_library,
     telemetry=None, prev_tm=None, prev_util=None,
     prev_selected_indicator=None, prev_disturbance=0.0,
+    failure_mask=None,
     feature_variant="legacy",
     device="cpu",
 ):
@@ -434,16 +434,16 @@ def build_od_features_plus(
 
     OD features [num_od, 18]:
       0-9: same as original
-      10: hop_count — shortest path hop count, normalized
-      11: demand_change_ratio — tm_t / tm_{t-1}, normalized to [0, 1]
+      10: hop_count — best surviving-path hop count, normalized
+      11: demand_change_ratio blended with path-set shrink ratio
       12: src_congestion — max_util_out of source node
       13: dst_congestion — max_util_in of dest node
       14: legacy=path_overlap_score, section3=absolute_bottleneck_delta,
-          section7=blend(absolute_bottleneck_delta, prev_selected)
-      15: ecmp_contribution — demand * bottleneck_util / sum(all demands * bottleneck_utils)
-      16: alternative_path_headroom — max headroom across non-best paths
+          section7=failure-aware bottleneck delta with previous-best invalid flag
+      15: explicit bottleneck_perception score
+      16: best alternate surviving-path headroom
       17: legacy=demand_x_hop, section3=absolute_demand_delta,
-          section7=blend(absolute_demand_delta, prev_disturbance)
+          section7=blend(absolute_demand_delta, shrink ratio, prev disturbance)
     """
     dev = torch.device(device)
     variant = _normalize_feature_variant(feature_variant)
@@ -483,23 +483,65 @@ def build_od_features_plus(
     np.maximum.at(max_util_out, src_idx, util)
     np.maximum.at(max_util_in, dst_idx, util)
 
-    # Alternative path headroom
+    fail_mask = np.zeros(num_edges, dtype=np.float64)
+    if failure_mask is not None:
+        src = np.asarray(failure_mask, dtype=np.float64).reshape(-1)
+        fail_mask[: min(num_edges, src.size)] = src[: min(num_edges, src.size)]
+    elif telemetry is not None and hasattr(telemetry, "failure_mask") and telemetry.failure_mask is not None:
+        src = np.asarray(telemetry.failure_mask, dtype=np.float64).reshape(-1)
+        fail_mask[: min(num_edges, src.size)] = src[: min(num_edges, src.size)]
+
     alt_path_headroom = np.zeros(num_od, dtype=np.float64)
+    surviving_best_headroom = np.zeros(num_od, dtype=np.float64)
+    surviving_path_count = np.zeros(num_od, dtype=np.float64)
+    path_set_shrink_ratio = np.zeros(num_od, dtype=np.float64)
+    prev_best_invalid_flag = np.zeros(num_od, dtype=np.float64)
 
     for od_idx in range(num_od):
         if path_costs[od_idx] > 0.0:
             sensitivity_scores[od_idx] = float(tm[od_idx]) * float(path_costs[od_idx])
-        path_edges = best_path_edges_list[od_idx]
+
+        all_paths = path_library.edge_idx_paths_by_od[od_idx]
+        best_path_edges = best_path_edges_list[od_idx]
+        surviving_paths: list[list[int]] = []
+        if best_path_edges:
+            prev_best_invalid_flag[od_idx] = float(np.any(fail_mask[np.asarray(best_path_edges, dtype=np.int64)] > 0.5))
+        for edge_path in all_paths:
+            if not edge_path:
+                continue
+            edge_idx = np.asarray(edge_path, dtype=np.int64)
+            if edge_idx.size == 0:
+                continue
+            if np.any(fail_mask[edge_idx] > 0.5):
+                continue
+            surviving_paths.append(list(edge_path))
+
+        total_paths = max(len(all_paths), 1)
+        surviving_path_count[od_idx] = float(len(surviving_paths))
+        path_set_shrink_ratio[od_idx] = 1.0 - float(len(surviving_paths)) / float(total_paths)
+
+        selected_path_edges = list(best_path_edges)
+        if surviving_paths:
+            selected_path_edges = min(
+                surviving_paths,
+                key=lambda p: (len(p), float(np.max(util[np.asarray(p, dtype=np.int64)])) if len(p) else 0.0),
+            )
+
+        path_edges = selected_path_edges
         if path_edges:
-            path_utils = util[np.asarray(path_edges, dtype=np.int64)]
+            path_idx = np.asarray(path_edges, dtype=np.int64)
+            path_utils = util[path_idx]
             bottleneck_util[od_idx] = float(np.max(path_utils)) if path_utils.size else 0.0
             mean_path_util[od_idx] = float(np.mean(path_utils)) if path_utils.size else 0.0
+            hop_count[od_idx] = float(path_idx.size)
+            surviving_best_headroom[od_idx] = float(max(0.0, 1.0 - np.max(path_utils))) if path_utils.size else 0.0
             if prev_util_arr is not None and path_utils.size:
-                prev_path_utils = prev_util_arr[np.asarray(path_edges, dtype=np.int64)]
+                prev_path_utils = prev_util_arr[path_idx]
                 bottleneck_delta_abs[od_idx] = abs(float(np.max(path_utils)) - float(np.max(prev_path_utils)))
 
-        for alt_edges in cache["alt_edge_paths"][od_idx]:
-            if not alt_edges:
+        alt_candidates = surviving_paths if surviving_paths else cache["alt_edge_paths"][od_idx]
+        for alt_edges in alt_candidates:
+            if not alt_edges or list(alt_edges) == list(path_edges):
                 continue
             path_utils = util[np.asarray(alt_edges, dtype=np.int64)]
             if path_utils.size:
@@ -519,6 +561,8 @@ def build_od_features_plus(
 
     # --- NEW features ---
 
+    surviving_paths_norm = surviving_path_count / (np.max(surviving_path_count) + 1e-12)
+
     # 10: hop_count normalized
     hop_count_norm = hop_count / (np.max(hop_count) + 1e-12)
 
@@ -529,7 +573,7 @@ def build_od_features_plus(
         prev = np.asarray(prev_tm, dtype=np.float64)
         ratio = tm / (prev + 1e-12)
         ratio_clipped = np.clip(ratio, 0.5, 2.0)
-        demand_change = (ratio_clipped - 0.5) / 1.5  # [0, 1]
+        demand_change = (ratio_clipped - 0.5) / 1.5
         demand_delta_abs = np.abs(tm - prev)
 
     # 12: src_congestion
@@ -547,10 +591,12 @@ def build_od_features_plus(
     valid_hops = hop_count > 0
     path_overlap[valid_hops] = overlap_mass[valid_hops] / hop_count[valid_hops]
 
-    # 15: ecmp_contribution — this OD's share of total congestion pressure
+    # 15: bottleneck perception / congestion pressure
     bn_scores = tm * bottleneck_util
     total_bn = np.sum(bn_scores) + 1e-12
     ecmp_contribution = bn_scores / total_bn
+    bottleneck_perception_raw = tm * np.maximum.reduce([bottleneck_util, src_congestion, dst_congestion])
+    bottleneck_perception = bottleneck_perception_raw / (np.max(bottleneck_perception_raw) + 1e-12)
 
     # 16: alt_path_headroom already computed above
 
@@ -561,43 +607,50 @@ def build_od_features_plus(
     demand_delta_abs_norm = demand_delta_abs / (np.max(demand_delta_abs) + 1e-12)
     prev_selected = _normalize_prev_selected_indicator(prev_selected_indicator, num_od)
     prev_dist_scalar = float(np.clip(prev_disturbance, 0.0, 1.0))
+    demand_change_feature = np.clip(0.70 * demand_change + 0.30 * path_set_shrink_ratio, 0.0, 1.0)
 
     if variant == "legacy":
         od_stress_feature = path_overlap
         od_tail_feature = demand_x_hop_norm
+        path_count_feature = num_paths_norm
+        congestion_feature = ecmp_contribution
     elif variant == "section3_physical":
         od_stress_feature = bottleneck_delta_abs_norm
         od_tail_feature = demand_delta_abs_norm
+        path_count_feature = num_paths_norm
+        congestion_feature = ecmp_contribution
     else:
         od_stress_feature = np.clip(
-            0.70 * bottleneck_delta_abs_norm + 0.30 * prev_selected,
+            0.55 * bottleneck_delta_abs_norm + 0.25 * prev_selected + 0.20 * prev_best_invalid_flag,
             0.0,
             1.0,
         )
         od_tail_feature = np.clip(
-            0.70 * demand_delta_abs_norm + 0.30 * prev_dist_scalar,
+            0.50 * demand_delta_abs_norm + 0.25 * path_set_shrink_ratio + 0.15 * prev_dist_scalar + 0.10 * prev_best_invalid_flag,
             0.0,
             1.0,
         )
+        path_count_feature = surviving_paths_norm
+        congestion_feature = np.clip(0.70 * bottleneck_perception + 0.30 * ecmp_contribution, 0.0, 1.0)
 
     # Stack all 18 features
     od_feat = np.stack([
         tm_norm,               # 0
         path_costs_norm,       # 1
-        num_paths_norm,        # 2
+        path_count_feature,    # 2
         bottleneck_util,       # 3
         mean_path_util,        # 4
-        headroom,              # 5
+        np.maximum(headroom, surviving_best_headroom),  # 5
         sensitivity_norm,      # 6
         active,                # 7
         demand_rank,           # 8
         np.log1p(tm) / (np.log1p(np.max(tm)) + 1e-12),  # 9
         hop_count_norm,        # 10 NEW
-        demand_change,         # 11 NEW
+        demand_change_feature, # 11 NEW
         src_congestion,        # 12 NEW
         dst_congestion,        # 13 NEW
         od_stress_feature,     # 14 NEW
-        ecmp_contribution,     # 15 NEW
+        congestion_feature,    # 15 NEW
         alt_path_headroom,     # 16 NEW
         od_tail_feature,       # 17 NEW
     ], axis=1).astype(np.float32)
@@ -618,7 +671,7 @@ def build_od_features_plus(
 # ---------------------------------------------------------------------------
 
 class GNNPlusFlowSelector(GNNFlowSelector):
-    """GNN+ with richer features and dynamic bounded K.
+    """GNN+ with richer features and config-driven bounded K.
 
     Inherits full architecture from GNNFlowSelector.
     Only difference: adjusted input dimensions and bounded k_pred.
@@ -627,9 +680,9 @@ class GNNPlusFlowSelector(GNNFlowSelector):
     def __init__(self, cfg: GNNPlusConfig):
         # GNNFlowSelector.__init__ handles everything
         super().__init__(cfg)
-        # Override k bounds for safety
-        self._k_min = 15
-        self._k_max = 40
+        # Respect configured bounds instead of hardcoded internal limits.
+        self._k_min = int(getattr(cfg, "k_crit_min", 15))
+        self._k_max = int(getattr(cfg, "k_crit_max", 40))
 
     def select_critical_flows(
         self,
@@ -750,6 +803,7 @@ def build_graph_tensors_plus_section3(
 def build_od_features_plus_section3(
     dataset, tm_vector, path_library,
     telemetry=None, prev_tm=None, prev_util=None,
+    failure_mask=None,
     device="cpu",
 ):
     """Section 3 physical/stress-aware GNN+ OD features."""
@@ -760,6 +814,7 @@ def build_od_features_plus_section3(
         telemetry=telemetry,
         prev_tm=prev_tm,
         prev_util=prev_util,
+        failure_mask=failure_mask,
         feature_variant="section3_physical",
         device=device,
     )
@@ -792,6 +847,7 @@ def build_od_features_plus_section7(
     dataset, tm_vector, path_library,
     telemetry=None, prev_tm=None, prev_util=None,
     prev_selected_indicator=None, prev_disturbance=0.0,
+    failure_mask=None,
     device="cpu",
 ):
     """Section 7 temporal/stability-aware GNN+ OD features."""
@@ -804,6 +860,7 @@ def build_od_features_plus_section7(
         prev_util=prev_util,
         prev_selected_indicator=prev_selected_indicator,
         prev_disturbance=prev_disturbance,
+        failure_mask=failure_mask,
         feature_variant="section7_temporal",
         device=device,
     )

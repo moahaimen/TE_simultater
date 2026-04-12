@@ -90,7 +90,11 @@ SUP_MAX_EPOCHS = 12
 SUP_PATIENCE = 4
 RL_MAX_EPOCHS = 4
 RL_PATIENCE = 2
-CONTINUITY_BONUS = 0.10
+SOFT_TEACHER_WEIGHT = 0.45
+CRITICALITY_WEIGHT = 0.25
+LP_TEACHER_WEIGHT = 4.0
+CONTINUITY_BONUS = float(os.environ.get("GNNPLUS_CONTINUITY_BONUS", "0.05"))
+FINAL_TEACHER_FORCING_PROB = 0.15
 
 KNOWN_TOPOLOGIES = ["abilene", "cernet", "geant", "ebone", "sprintlink", "tiscali"]
 UNSEEN_TOPOLOGIES = ["germany50", "vtlwavenet2011"]
@@ -114,11 +118,12 @@ METHOD_LABELS = {
     "gnnplus": "GNN+",
 }
 
-OUTPUT_DIR = PROJECT_ROOT / "results" / "gnnplus_improved_fixedk40_experiment"
+EXPERIMENT_TAG = os.environ.get("GNNPLUS_EXPERIMENT_TAG", "gnnplus_roadmap_step1to6_experiment")
+OUTPUT_DIR = PROJECT_ROOT / "results" / EXPERIMENT_TAG
 TRAIN_DIR = OUTPUT_DIR / "training"
 PLOTS_DIR = OUTPUT_DIR / "plots"
 COMPARISON_DIR = OUTPUT_DIR / "comparison"
-REPORT_DOCX = OUTPUT_DIR / "GNNPLUS_IMPROVED_FIXEDK40_ZERO_SHOT_REPORT.docx"
+REPORT_DOCX = OUTPUT_DIR / "GNNPLUS_ROADMAP_STEP1TO6_ZERO_SHOT_REPORT.docx"
 AUDIT_MD = OUTPUT_DIR / "experiment_audit.md"
 
 SUMMARY_CSV = OUTPUT_DIR / "packet_sdn_summary.csv"
@@ -202,9 +207,69 @@ def build_section7_inputs(sample: dict, *, device: str):
         prev_util=sample["prev_util"],
         prev_selected_indicator=sample["prev_selected_indicator"],
         prev_disturbance=sample["prev_disturbance"],
+        failure_mask=sample.get("failure_mask"),
         device=device,
     )
     return graph_data, od_data
+
+
+def scheduled_teacher_forcing_prob(epoch: int, total_epochs: int) -> float:
+    if total_epochs <= 1:
+        return float(FINAL_TEACHER_FORCING_PROB)
+    alpha = float(max(epoch - 1, 0)) / float(max(total_epochs - 1, 1))
+    return float((1.0 - alpha) * 1.0 + alpha * FINAL_TEACHER_FORCING_PROB)
+
+
+def materialize_scheduled_history(
+    samples: list[dict],
+    model: GNNPlusFlowSelector,
+    *,
+    teacher_forcing_prob: float,
+    seed: int,
+) -> list[dict]:
+    if not samples:
+        return []
+
+    rng = np.random.default_rng(seed)
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for sample in samples:
+        grouped[str(sample["topology"])].append(sample)
+
+    was_training = model.training
+    model.eval()
+    materialized: list[dict] = []
+    with torch.no_grad():
+        for topo_key in sorted(grouped):
+            topo_samples = sorted(grouped[topo_key], key=lambda item: int(item.get("timestep", 0)))
+            model_prev_indicator = None
+            for sample in topo_samples:
+                teacher_prev = np.asarray(
+                    sample.get("teacher_prev_selected_indicator", sample["prev_selected_indicator"]),
+                    dtype=np.float32,
+                )
+                if model_prev_indicator is None or rng.random() < float(teacher_forcing_prob):
+                    prev_indicator = teacher_prev
+                else:
+                    prev_indicator = np.asarray(model_prev_indicator, dtype=np.float32)
+
+                scheduled = dict(sample)
+                scheduled["prev_selected_indicator"] = np.asarray(prev_indicator, dtype=np.float32)
+                materialized.append(scheduled)
+
+                graph_data, od_data = build_section7_inputs(scheduled, device=DEVICE)
+                scores, _, _ = model(graph_data, od_data)
+                selected, _, _ = continuity_select(
+                    scores,
+                    active_mask=(scheduled["tm_vector"] > 1e-12),
+                    k=K_CRIT,
+                    prev_selected_indicator=scheduled["prev_selected_indicator"],
+                    continuity_bonus=CONTINUITY_BONUS,
+                )
+                model_prev_indicator = selection_indicator(len(scheduled["dataset"].od_pairs), selected)
+
+    if was_training:
+        model.train()
+    return materialized
 
 
 def continuity_select(
@@ -306,7 +371,7 @@ def collect_split_samples(
                     capacities=capacities,
                     k_crit=K_CRIT,
                     lp_time_limit_sec=LP_TIME_LIMIT,
-                    lp_teacher_weight=2.5,
+                    lp_teacher_weight=LP_TEACHER_WEIGHT,
                 )
             except Exception:
                 prev_tm = tm_vector
@@ -322,6 +387,7 @@ def collect_split_samples(
                     "dataset": dataset,
                     "path_library": path_library,
                     "tm_vector": tm_vector,
+                    "timestep": int(t_idx),
                     "prev_tm": None if prev_tm is None else np.asarray(prev_tm, dtype=float),
                     "telemetry": telemetry,
                     "oracle_selected": list(oracle_selected),
@@ -334,6 +400,7 @@ def collect_split_samples(
                     "weights": weights,
                     "prev_util": None if prev_util is None else np.asarray(prev_util, dtype=float),
                     "prev_selected_indicator": np.asarray(prev_selected, dtype=np.float32),
+                    "teacher_prev_selected_indicator": np.asarray(prev_selected, dtype=np.float32),
                     "prev_disturbance": float(prev_disturbance),
                     "prev_splits": clone_splits(prev_splits),
                 }
@@ -410,12 +477,25 @@ def run_supervised_training(train_samples: list[dict], val_samples: list[dict]):
     print(f"[supervised] train={len(train_samples)} val={len(val_samples)}", flush=True)
     for epoch in range(1, SUP_MAX_EPOCHS + 1):
         epoch_start = time.perf_counter()
+        teacher_prob = scheduled_teacher_forcing_prob(epoch, SUP_MAX_EPOCHS)
+        epoch_train_samples = materialize_scheduled_history(
+            train_samples,
+            model,
+            teacher_forcing_prob=teacher_prob,
+            seed=SEED + epoch,
+        )
+        epoch_val_samples = materialize_scheduled_history(
+            val_samples,
+            model,
+            teacher_forcing_prob=0.0,
+            seed=SEED + 100 + epoch,
+        )
         model.train()
-        order = rng.permutation(len(train_samples))
+        order = rng.permutation(len(epoch_train_samples))
         epoch_losses = []
 
         for idx in order:
-            sample = train_samples[int(idx)]
+            sample = epoch_train_samples[int(idx)]
             graph_data, od_data = build_section7_inputs(sample, device=DEVICE)
             scores, _, _ = model(graph_data, od_data)
 
@@ -430,8 +510,8 @@ def run_supervised_training(train_samples: list[dict], val_samples: list[dict]):
                 scores,
                 soft_target=torch.tensor(sample["soft_teacher"], dtype=torch.float32, device=DEVICE),
                 criticality=torch.tensor(sample["continuous_criticality"], dtype=torch.float32, device=DEVICE),
-                soft_weight=0.35,
-                criticality_weight=0.20,
+                soft_weight=SOFT_TEACHER_WEIGHT,
+                criticality_weight=CRITICALITY_WEIGHT,
             )
             optimizer.zero_grad()
             loss.backward()
@@ -446,7 +526,7 @@ def run_supervised_training(train_samples: list[dict], val_samples: list[dict]):
         val_losses = []
         val_overlap = []
         with torch.no_grad():
-            for sample in val_samples:
+            for sample in epoch_val_samples:
                 graph_data, od_data = build_section7_inputs(sample, device=DEVICE)
                 scores, _, _ = model(graph_data, od_data)
                 num_od = scores.size(0)
@@ -459,8 +539,8 @@ def run_supervised_training(train_samples: list[dict], val_samples: list[dict]):
                     scores,
                     soft_target=torch.tensor(sample["soft_teacher"], dtype=torch.float32, device=DEVICE),
                     criticality=torch.tensor(sample["continuous_criticality"], dtype=torch.float32, device=DEVICE),
-                    soft_weight=0.35,
-                    criticality_weight=0.20,
+                    soft_weight=SOFT_TEACHER_WEIGHT,
+                    criticality_weight=CRITICALITY_WEIGHT,
                 )
                 val_losses.append(float(vloss.item()))
 
@@ -484,11 +564,12 @@ def run_supervised_training(train_samples: list[dict], val_samples: list[dict]):
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_selection_overlap": overlap,
+                "teacher_forcing_prob": teacher_prob,
                 "epoch_time_sec": float(time.perf_counter() - epoch_start),
             }
         )
         print(
-            f"[supervised] epoch={epoch:02d} train_loss={train_loss:.4f} val_loss={val_loss:.4f} overlap={overlap:.3f}",
+            f"[supervised] epoch={epoch:02d} train_loss={train_loss:.4f} val_loss={val_loss:.4f} overlap={overlap:.3f} teacher_prob={teacher_prob:.2f}",
             flush=True,
         )
 
@@ -523,8 +604,8 @@ def run_supervised_training(train_samples: list[dict], val_samples: list[dict]):
         "training_time_sec": float(time.perf_counter() - start),
         "continuity_bonus": float(CONTINUITY_BONUS),
         "feature_variant": "section7_temporal",
-        "soft_teacher_weight": 0.35,
-        "criticality_weight": 0.20,
+        "soft_teacher_weight": SOFT_TEACHER_WEIGHT,
+        "criticality_weight": CRITICALITY_WEIGHT,
     }
     return model, summary
 
@@ -542,14 +623,15 @@ def run_rl_finetune(model: GNNPlusFlowSelector, train_samples: list[dict], val_s
         max_epochs=RL_MAX_EPOCHS,
         patience=RL_PATIENCE,
         baseline_ema=0.9,
-        w_reward_mlu=1.0,
-        w_reward_improvement=0.8,
-        w_reward_disturbance=0.25,
+        w_reward_mlu=1.15,
+        w_reward_improvement=0.85,
+        w_reward_disturbance=0.15,
         w_reward_infeasible=2.0,
-        w_reward_vs_bottleneck=0.35,
-        w_reward_vs_reference=0.20,
+        w_reward_vs_bottleneck=0.45,
+        w_reward_vs_reference=0.15,
+        w_reward_bottleneck_margin=0.10,
         rank_loss_weight=0.25,
-        score_margin_weight=0.05,
+        score_margin_weight=0.08,
         infeasible_mlu_penalty=10.0,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=float(rl_cfg.lr))
@@ -567,8 +649,20 @@ def run_rl_finetune(model: GNNPlusFlowSelector, train_samples: list[dict], val_s
 
     for epoch in range(1, rl_cfg.max_epochs + 1):
         epoch_start = time.perf_counter()
+        epoch_train_samples = materialize_scheduled_history(
+            rl_train,
+            model,
+            teacher_forcing_prob=0.0,
+            seed=SEED + 200 + epoch,
+        )
+        epoch_val_samples = materialize_scheduled_history(
+            rl_val,
+            model,
+            teacher_forcing_prob=0.0,
+            seed=SEED + 400 + epoch,
+        )
         model.train()
-        order = rng.permutation(len(rl_train))
+        order = rng.permutation(len(epoch_train_samples))
         epoch_rewards = []
         epoch_mlus = []
         epoch_disturbances = []
@@ -577,7 +671,7 @@ def run_rl_finetune(model: GNNPlusFlowSelector, train_samples: list[dict], val_s
         epoch_vs_ref = []
 
         for idx in order:
-            sample = rl_train[int(idx)]
+            sample = epoch_train_samples[int(idx)]
             graph_data, od_data = build_section7_inputs(sample, device=DEVICE)
             scores, _, _ = model(graph_data, od_data)
 
@@ -658,6 +752,7 @@ def run_rl_finetune(model: GNNPlusFlowSelector, train_samples: list[dict], val_s
                 - float(rl_cfg.w_reward_disturbance) * float(disturbance)
                 - float(rl_cfg.w_reward_infeasible) * (0.0 if feasible else 1.0)
                 + float(rl_cfg.w_reward_vs_bottleneck) * float(vs_bn)
+                + float(rl_cfg.w_reward_bottleneck_margin) * float(max(vs_bn, 0.0))
                 + float(rl_cfg.w_reward_vs_reference) * float(vs_ref)
             )
             baseline_reward = reward if baseline_reward is None else float(rl_cfg.baseline_ema) * baseline_reward + (1.0 - float(rl_cfg.baseline_ema)) * reward
@@ -691,7 +786,7 @@ def run_rl_finetune(model: GNNPlusFlowSelector, train_samples: list[dict], val_s
         model.eval()
         val_mlus = []
         with torch.no_grad():
-            for sample in rl_val:
+            for sample in epoch_val_samples:
                 graph_data, od_data = build_section7_inputs(sample, device=DEVICE)
                 scores, _, _ = model(graph_data, od_data)
                 selected_ods, _, _ = continuity_select(
@@ -813,6 +908,7 @@ def gnnplus_select_stateful(
         prev_util=prev_util,
         prev_selected_indicator=prev_selected_indicator,
         prev_disturbance=prev_disturbance,
+        failure_mask=failure_mask,
         device=DEVICE,
     )
     active_mask = ((np.asarray(tm_vector, dtype=np.float64) > 1e-12) & surviving_od_mask(path_library)).astype(np.float32)
@@ -1315,7 +1411,7 @@ def add_title_page(doc: Document) -> None:
         doc.add_paragraph()
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run("Improved GNN+ Fixed-K40 Zero-Shot Report")
+    run = title.add_run("GNN+ Roadmap Step1-6 Zero-Shot Report")
     run.bold = True
     run.font.size = Pt(22)
     run.font.color.rgb = RGBColor(0x1A, 0x47, 0x80)

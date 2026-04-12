@@ -11,15 +11,15 @@ EPS = 1e-12
 
 @dataclass
 class ReactiveRewardConfig:
-    w_mlu: float = 1.5
+    w_mlu: float = 1.8
     w_delay: float = 1.0
-    w_dist: float = 0.4
+    w_dist: float = 0.25
     w_loss: float = 1.0
     w_fail: float = 1.0
     w_feas: float = 0.1
     w_thr: float = 0.3
     w_jit: float = 0.2
-    w_reroute_mass: float = 0.15
+    w_reroute_mass: float = 0.10
 
 
 def compute_reactive_reward(

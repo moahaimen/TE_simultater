@@ -151,6 +151,21 @@ def _teacher_score_from_lp(
     return scores
 
 
+def _lp_guided_teacher_scores(lp_scores: np.ndarray, tm_vector: np.ndarray) -> np.ndarray:
+    """Turn LP movement into a sharper OD priority signal."""
+    lp = np.maximum(np.asarray(lp_scores, dtype=np.float64), 0.0)
+    if lp.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    lp_max = float(np.max(lp))
+    if lp_max <= EPS:
+        return np.zeros(lp.shape[0], dtype=np.float32)
+    lp_norm = lp / lp_max
+    demand = np.maximum(np.asarray(tm_vector, dtype=np.float64), 0.0)
+    demand_norm = demand / max(float(np.max(demand)), EPS)
+    boosted = 0.75 * lp_norm + 0.25 * (lp_norm * demand_norm)
+    return boosted.astype(np.float32)
+
+
 def _topk_indices(scores: np.ndarray, k_crit: int) -> list[int]:
     if scores.size == 0 or int(k_crit) <= 0:
         return []
@@ -213,7 +228,7 @@ def build_teacher_dataset(
 ) -> TeacherDataSummary:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    heuristic_weights = heuristic_weights or {"topk": 1.0, "bottleneck": 1.2, "sensitivity": 1.2, "lp_opt": 2.5}
+    heuristic_weights = heuristic_weights or {"topk": 0.9, "bottleneck": 1.15, "sensitivity": 1.0, "lp_opt": 4.0}
     summary_rows = []
     total_samples = 0
 
@@ -305,7 +320,7 @@ def build_teacher_dataset(
                         time_limit_sec=int(lp_teacher_time_limit_sec),
                     )
                     if float(lp_scores.sum()) > 0.0:
-                        teacher_scores += float(heuristic_weights.get("lp_opt", 1.5)) * lp_scores
+                        teacher_scores += float(heuristic_weights.get("lp_opt", 4.0)) * _lp_guided_teacher_scores(lp_scores, tm_vector)
                         lp_teacher_solved += 1
 
                 teacher_selected = _topk_indices(teacher_scores, env_cfg.k_crit)
