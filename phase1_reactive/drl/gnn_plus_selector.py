@@ -129,6 +129,26 @@ def _ensure_legacy_graph_cache(cache: Dict[str, object]) -> Dict[str, object]:
     return cache
 
 
+def _cached_long_tensor(
+    cache: Dict[str, object],
+    *,
+    tensor_key: str,
+    array_key: str,
+    device: torch.device,
+) -> torch.Tensor:
+    tensor = cache.get(tensor_key)
+    if tensor is None:
+        base = np.ascontiguousarray(np.asarray(cache[array_key], dtype=np.int64))
+        tensor = torch.from_numpy(base).long()
+        cache[tensor_key] = tensor
+    return tensor if device.type == "cpu" else tensor.to(device=device)
+
+
+def _float_tensor_from_numpy(array: np.ndarray, device: torch.device) -> torch.Tensor:
+    tensor = torch.from_numpy(np.ascontiguousarray(array.astype(np.float32, copy=False)))
+    return tensor if device.type == "cpu" else tensor.to(device=device)
+
+
 def _get_plus_topology_cache(dataset, path_library) -> Dict[str, object]:
     key = _topology_cache_key(dataset, path_library)
     cached = _PLUS_TOPOLOGY_CACHE.get(key)
@@ -240,7 +260,12 @@ def build_graph_tensors_plus(
     node_to_idx = cache["node_to_idx"]
     src_idx = np.asarray(cache["edge_index_np"][0], dtype=np.int64)
     dst_idx = np.asarray(cache["edge_index_np"][1], dtype=np.int64)
-    edge_index = torch.tensor(cache["edge_index_np"], dtype=torch.long, device=dev)
+    edge_index = _cached_long_tensor(
+        cache,
+        tensor_key="edge_index_tensor_cpu",
+        array_key="edge_index_np",
+        device=dev,
+    )
     adjacency = None
     neighbor_counts = None
     if variant == "legacy":
@@ -319,7 +344,7 @@ def build_graph_tensors_plus(
         cap_norm, log_cap, weight_norm, util, delay, congested, headroom, fail,
         od_per_edge_norm, residual_cap_norm, edge_stress_feature, is_bottleneck,
     ], axis=1).astype(np.float32)
-    edge_features = torch.tensor(edge_feat, dtype=torch.float32, device=dev)
+    edge_features = _float_tensor_from_numpy(edge_feat, dev)
 
     # --- Node features (fill placeholders 12-15 with real features) ---
     in_degree = np.bincount(dst_idx, minlength=num_nodes).astype(np.float64)
@@ -446,7 +471,7 @@ def build_graph_tensors_plus(
         node_tail_feature,                                                  # 15 NEW
     ], axis=1)[:, :16].astype(np.float32)
 
-    node_features = torch.tensor(node_feat, dtype=torch.float32, device=dev)
+    node_features = _float_tensor_from_numpy(node_feat, dev)
 
     return {
         "node_features": node_features,
@@ -495,9 +520,9 @@ def build_od_features_plus(
     od_dst = np.asarray(cache["od_dst"], dtype=np.int64)
 
     # --- Original features ---
-    sensitivity_scores = np.zeros(num_od, dtype=np.float32)
     path_costs = np.asarray(cache["path_costs"], dtype=np.float64).copy()
     num_paths = np.asarray(cache["num_paths"], dtype=np.float64).copy()
+    sensitivity_scores = (tm * path_costs).astype(np.float32, copy=False)
     bottleneck_util = np.zeros(num_od, dtype=np.float64)
     mean_path_util = np.zeros(num_od, dtype=np.float64)
     bottleneck_delta_abs = np.zeros(num_od, dtype=np.float64)
@@ -527,41 +552,46 @@ def build_od_features_plus(
         src = np.asarray(telemetry.failure_mask, dtype=np.float64).reshape(-1)
         fail_mask[: min(num_edges, src.size)] = src[: min(num_edges, src.size)]
 
+    has_active_failure = bool(np.sum(fail_mask) > 0.5)
     alt_path_headroom = np.zeros(num_od, dtype=np.float64)
     surviving_best_headroom = np.zeros(num_od, dtype=np.float64)
-    surviving_path_count = np.zeros(num_od, dtype=np.float64)
+    surviving_path_count = num_paths.copy()
     path_set_shrink_ratio = np.zeros(num_od, dtype=np.float64)
     prev_best_invalid_flag = np.zeros(num_od, dtype=np.float64)
 
     for od_idx in range(num_od):
-        if path_costs[od_idx] > 0.0:
-            sensitivity_scores[od_idx] = float(tm[od_idx]) * float(path_costs[od_idx])
-
         all_paths = path_library.edge_idx_paths_by_od[od_idx]
         best_path_edges = best_path_edges_list[od_idx]
-        surviving_paths: list[list[int]] = []
-        if best_path_edges:
-            prev_best_invalid_flag[od_idx] = float(np.any(fail_mask[np.asarray(best_path_edges, dtype=np.int64)] > 0.5))
-        for edge_path in all_paths:
-            if not edge_path:
-                continue
-            edge_idx = np.asarray(edge_path, dtype=np.int64)
-            if edge_idx.size == 0:
-                continue
-            if np.any(fail_mask[edge_idx] > 0.5):
-                continue
-            surviving_paths.append(list(edge_path))
-
-        total_paths = max(len(all_paths), 1)
-        surviving_path_count[od_idx] = float(len(surviving_paths))
-        path_set_shrink_ratio[od_idx] = 1.0 - float(len(surviving_paths)) / float(total_paths)
-
         selected_path_edges = list(best_path_edges)
-        if surviving_paths:
-            selected_path_edges = min(
-                surviving_paths,
-                key=lambda p: (len(p), float(np.max(util[np.asarray(p, dtype=np.int64)])) if len(p) else 0.0),
-            )
+        alt_candidates: Sequence[Sequence[int]]
+        if has_active_failure:
+            surviving_paths: list[list[int]] = []
+            if best_path_edges:
+                prev_best_invalid_flag[od_idx] = float(
+                    np.any(fail_mask[np.asarray(best_path_edges, dtype=np.int64)] > 0.5)
+                )
+            for edge_path in all_paths:
+                if not edge_path:
+                    continue
+                edge_idx = np.asarray(edge_path, dtype=np.int64)
+                if edge_idx.size == 0 or np.any(fail_mask[edge_idx] > 0.5):
+                    continue
+                surviving_paths.append(list(edge_path))
+
+            total_paths = max(len(all_paths), 1)
+            surviving_path_count[od_idx] = float(len(surviving_paths))
+            path_set_shrink_ratio[od_idx] = 1.0 - float(len(surviving_paths)) / float(total_paths)
+            if surviving_paths:
+                selected_path_edges = min(
+                    surviving_paths,
+                    key=lambda path: (
+                        len(path),
+                        float(np.max(util[np.asarray(path, dtype=np.int64)])) if len(path) else 0.0,
+                    ),
+                )
+            alt_candidates = surviving_paths if surviving_paths else cache["alt_edge_paths"][od_idx]
+        else:
+            alt_candidates = cache["alt_edge_paths"][od_idx]
 
         path_edges = selected_path_edges
         if path_edges:
@@ -575,8 +605,7 @@ def build_od_features_plus(
                 prev_path_utils = prev_util_arr[path_idx]
                 bottleneck_delta_abs[od_idx] = abs(float(np.max(path_utils)) - float(np.max(prev_path_utils)))
 
-        alt_candidates = surviving_paths if surviving_paths else cache["alt_edge_paths"][od_idx]
-        for alt_edges in alt_candidates:
+        for alt_edges in alt_candidates[:3]:
             if not alt_edges or list(alt_edges) == list(path_edges):
                 continue
             path_utils = util[np.asarray(alt_edges, dtype=np.int64)]
@@ -592,8 +621,8 @@ def build_od_features_plus(
 
     demand_rank = np.zeros(num_od, dtype=np.float64)
     sorted_idx = np.argsort(tm)
-    for rank, idx in enumerate(sorted_idx):
-        demand_rank[idx] = float(rank) / max(float(num_od - 1), 1.0)
+    if num_od > 1:
+        demand_rank[sorted_idx] = np.linspace(0.0, 1.0, num_od, dtype=np.float64)
 
     # --- NEW features ---
 
@@ -713,11 +742,21 @@ def build_od_features_plus(
     bottleneck_scores = tm.astype(np.float32) * bottleneck_util.astype(np.float32)
 
     return {
-        "od_features": torch.tensor(od_feat, dtype=torch.float32, device=dev),
-        "od_src_idx": torch.tensor(od_src, dtype=torch.long, device=dev),
-        "od_dst_idx": torch.tensor(od_dst, dtype=torch.long, device=dev),
-        "sensitivity_scores": torch.tensor(sensitivity_scores, dtype=torch.float32, device=dev),
-        "bottleneck_scores": torch.tensor(bottleneck_scores, dtype=torch.float32, device=dev),
+        "od_features": _float_tensor_from_numpy(od_feat, dev),
+        "od_src_idx": _cached_long_tensor(
+            cache,
+            tensor_key="od_src_tensor_cpu",
+            array_key="od_src",
+            device=dev,
+        ),
+        "od_dst_idx": _cached_long_tensor(
+            cache,
+            tensor_key="od_dst_tensor_cpu",
+            array_key="od_dst",
+            device=dev,
+        ),
+        "sensitivity_scores": _float_tensor_from_numpy(sensitivity_scores, dev),
+        "bottleneck_scores": _float_tensor_from_numpy(bottleneck_scores, dev),
     }
 
 

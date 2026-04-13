@@ -90,10 +90,10 @@ SUP_MAX_EPOCHS = 12
 SUP_PATIENCE = 4
 RL_MAX_EPOCHS = 4
 RL_PATIENCE = 2
-SOFT_TEACHER_WEIGHT = 0.45
-CRITICALITY_WEIGHT = 0.25
-LP_TEACHER_WEIGHT = 4.0
 FEATURE_VARIANT = os.environ.get("GNNPLUS_FEATURE_VARIANT", "section7_temporal").strip().lower()
+SOFT_TEACHER_WEIGHT = float(os.environ.get("GNNPLUS_SOFT_TEACHER_WEIGHT", "0.45"))
+CRITICALITY_WEIGHT = float(os.environ.get("GNNPLUS_CRITICALITY_WEIGHT", "0.35"))
+LP_TEACHER_WEIGHT = float(os.environ.get("GNNPLUS_LP_TEACHER_WEIGHT", "6.0"))
 CONTINUITY_BONUS = float(os.environ.get("GNNPLUS_CONTINUITY_BONUS", "0.05"))
 FINAL_TEACHER_FORCING_PROB = float(os.environ.get("GNNPLUS_FINAL_TEACHER_FORCING_PROB", "0.15"))
 REWARD_MLU = float(os.environ.get("GNNPLUS_REWARD_MLU", "1.15"))
@@ -163,6 +163,13 @@ def feature_profile_description() -> str:
     if FEATURE_VARIANT == "section3_physical":
         return "Physical/stress-aware profile without the temporal continuity cues."
     return "Legacy GNN+ feature profile."
+
+
+def teacher_profile_description() -> str:
+    return (
+        "LP-strengthened soft teacher targets with continuous OD criticality regression "
+        "using Huber loss on normalized selector scores."
+    )
 
 
 def seed_all(seed: int) -> None:
@@ -632,6 +639,8 @@ def run_supervised_training(train_samples: list[dict], val_samples: list[dict]):
         "feature_profile": feature_profile_description(),
         "soft_teacher_weight": SOFT_TEACHER_WEIGHT,
         "criticality_weight": CRITICALITY_WEIGHT,
+        "lp_teacher_weight": LP_TEACHER_WEIGHT,
+        "teacher_profile": teacher_profile_description(),
     }
     return model, summary
 
@@ -1343,14 +1352,17 @@ def build_split_manifest() -> dict:
             "stable_metagate_used": False,
         },
         "improvements_enabled": {
+            "section1_failure_gated_features_and_cache": True,
             "section3_physical_features": True,
             "section4_soft_teacher_targets": True,
+            "section4_continuous_regression_targets": True,
             "section5_rl_reward_alignment": True,
             "section7_disturbance_aware_temporal_path": True,
         },
         "fixed_k": K_CRIT,
         "feature_variant": FEATURE_VARIANT,
         "feature_profile": feature_profile_description(),
+        "teacher_profile": teacher_profile_description(),
         "continuity_bonus": CONTINUITY_BONUS,
         "reward_profile": {
             "w_reward_mlu": REWARD_MLU,
@@ -1521,9 +1533,11 @@ def build_report(summary_df: pd.DataFrame, failure_df: pd.DataFrame, metrics_df:
     doc.add_heading("2. Improvements Enabled", level=1)
     improvements = pd.DataFrame(
         [
+            {"Section": "1", "Change": "Failure-gated OD feature path + cached topology tensors", "Enabled": "Yes"},
             {"Section": "1", "Change": f"Feature pruning profile ({FEATURE_VARIANT})", "Enabled": "Yes"},
             {"Section": "3", "Change": "Physical/stress-aware features", "Enabled": "Yes"},
-            {"Section": "4", "Change": "Soft teacher targets + continuous criticality", "Enabled": "Yes"},
+            {"Section": "4", "Change": "LP-strengthened soft teacher targets", "Enabled": "Yes"},
+            {"Section": "4", "Change": "Continuous OD criticality regression (Huber)", "Enabled": "Yes"},
             {"Section": "5", "Change": "RL fine-tuning with MLU/improvement/disturbance reward", "Enabled": "Yes"},
             {"Section": "7", "Change": "Scheduled-sampling temporal path + continuity bonus", "Enabled": "Yes"},
             {"Section": "6", "Change": f"Fixed K = {K_CRIT} main thesis branch", "Enabled": "Yes"},
@@ -1538,7 +1552,11 @@ def build_report(summary_df: pd.DataFrame, failure_df: pd.DataFrame, metrics_df:
             {"Field": "Final checkpoint", "Value": training_summary["final_checkpoint"]},
             {"Field": "Feature variant", "Value": training_summary["feature_variant"]},
             {"Field": "Feature profile", "Value": training_summary["supervised"]["feature_profile"]},
+            {"Field": "Teacher profile", "Value": training_summary["supervised"]["teacher_profile"]},
             {"Field": "Continuity bonus", "Value": training_summary["continuity_bonus"]},
+            {"Field": "Soft teacher weight", "Value": training_summary["supervised"]["soft_teacher_weight"]},
+            {"Field": "Criticality regression weight", "Value": training_summary["supervised"]["criticality_weight"]},
+            {"Field": "LP teacher weight", "Value": training_summary["supervised"]["lp_teacher_weight"]},
             {"Field": "Reward w_mlu", "Value": training_summary["reinforce"]["rl_config"]["w_reward_mlu"]},
             {"Field": "Reward w_improvement", "Value": training_summary["reinforce"]["rl_config"]["w_reward_improvement"]},
             {"Field": "Reward w_disturbance", "Value": training_summary["reinforce"]["rl_config"]["w_reward_disturbance"]},

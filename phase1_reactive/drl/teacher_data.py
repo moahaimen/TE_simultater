@@ -162,7 +162,7 @@ def _lp_guided_teacher_scores(lp_scores: np.ndarray, tm_vector: np.ndarray) -> n
     lp_norm = lp / lp_max
     demand = np.maximum(np.asarray(tm_vector, dtype=np.float64), 0.0)
     demand_norm = demand / max(float(np.max(demand)), EPS)
-    boosted = 0.75 * lp_norm + 0.25 * (lp_norm * demand_norm)
+    boosted = 0.85 * lp_norm + 0.15 * (lp_norm * demand_norm)
     return boosted.astype(np.float32)
 
 
@@ -228,7 +228,7 @@ def build_teacher_dataset(
 ) -> TeacherDataSummary:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    heuristic_weights = heuristic_weights or {"topk": 0.9, "bottleneck": 1.15, "sensitivity": 1.0, "lp_opt": 4.0}
+    heuristic_weights = heuristic_weights or {"topk": 0.9, "bottleneck": 1.15, "sensitivity": 1.0, "lp_opt": 6.0}
     summary_rows = []
     total_samples = 0
 

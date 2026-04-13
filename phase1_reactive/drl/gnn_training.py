@@ -195,8 +195,14 @@ def _soft_teacher_loss(
         crit_max = torch.max(crit)
         if float(crit_max.item()) > 0.0:
             crit = crit / crit_max
-            mse = F.mse_loss(torch.sigmoid(scores), crit)
-            loss = loss + float(criticality_weight) * mse
+            score_min = torch.min(scores)
+            score_span = torch.max(scores) - score_min
+            if float(score_span.item()) > 1e-12:
+                pred = (scores - score_min) / (score_span + 1e-12)
+            else:
+                pred = torch.zeros_like(scores)
+            regression = F.huber_loss(pred, crit, delta=0.15)
+            loss = loss + float(criticality_weight) * regression
     return loss
 
 
@@ -351,7 +357,7 @@ def _lp_guided_teacher_scores(lp_scores: np.ndarray, tm_vector: np.ndarray) -> n
     lp_norm = lp / lp_max
     demand = np.maximum(np.asarray(tm_vector, dtype=np.float64), 0.0)
     demand_norm = demand / max(float(np.max(demand)), 1e-12)
-    return (0.75 * lp_norm + 0.25 * (lp_norm * demand_norm)).astype(np.float32)
+    return (0.85 * lp_norm + 0.15 * (lp_norm * demand_norm)).astype(np.float32)
 
 
 def _collect_soft_teacher_targets(
