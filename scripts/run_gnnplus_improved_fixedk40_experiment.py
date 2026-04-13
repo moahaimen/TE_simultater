@@ -53,8 +53,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from phase1_reactive.drl.gnn_plus_selector import (  # noqa: E402
     GNNPlusConfig,
     GNNPlusFlowSelector,
-    build_graph_tensors_plus_section7,
-    build_od_features_plus_section7,
+    build_graph_tensors_plus,
+    build_od_features_plus,
     load_gnn_plus,
     save_gnn_plus,
 )
@@ -93,8 +93,15 @@ RL_PATIENCE = 2
 SOFT_TEACHER_WEIGHT = 0.45
 CRITICALITY_WEIGHT = 0.25
 LP_TEACHER_WEIGHT = 4.0
+FEATURE_VARIANT = os.environ.get("GNNPLUS_FEATURE_VARIANT", "section7_temporal").strip().lower()
 CONTINUITY_BONUS = float(os.environ.get("GNNPLUS_CONTINUITY_BONUS", "0.05"))
-FINAL_TEACHER_FORCING_PROB = 0.15
+FINAL_TEACHER_FORCING_PROB = float(os.environ.get("GNNPLUS_FINAL_TEACHER_FORCING_PROB", "0.15"))
+REWARD_MLU = float(os.environ.get("GNNPLUS_REWARD_MLU", "1.15"))
+REWARD_IMPROVEMENT = float(os.environ.get("GNNPLUS_REWARD_IMPROVEMENT", "0.85"))
+REWARD_DISTURBANCE = float(os.environ.get("GNNPLUS_REWARD_DISTURBANCE", "0.15"))
+REWARD_VS_BOTTLENECK = float(os.environ.get("GNNPLUS_REWARD_VS_BOTTLENECK", "0.45"))
+REWARD_VS_REFERENCE = float(os.environ.get("GNNPLUS_REWARD_VS_REFERENCE", "0.15"))
+REWARD_BOTTLENECK_MARGIN = float(os.environ.get("GNNPLUS_REWARD_BOTTLENECK_MARGIN", "0.10"))
 
 KNOWN_TOPOLOGIES = ["abilene", "cernet", "geant", "ebone", "sprintlink", "tiscali"]
 UNSEEN_TOPOLOGIES = ["germany50", "vtlwavenet2011"]
@@ -123,7 +130,7 @@ OUTPUT_DIR = PROJECT_ROOT / "results" / EXPERIMENT_TAG
 TRAIN_DIR = OUTPUT_DIR / "training"
 PLOTS_DIR = OUTPUT_DIR / "plots"
 COMPARISON_DIR = OUTPUT_DIR / "comparison"
-REPORT_DOCX = OUTPUT_DIR / "GNNPLUS_ROADMAP_STEP1TO6_ZERO_SHOT_REPORT.docx"
+REPORT_DOCX = OUTPUT_DIR / os.environ.get("GNNPLUS_REPORT_NAME", "GNNPLUS_ROADMAP_STEP1TO6_ZERO_SHOT_REPORT.docx")
 AUDIT_MD = OUTPUT_DIR / "experiment_audit.md"
 
 SUMMARY_CSV = OUTPUT_DIR / "packet_sdn_summary.csv"
@@ -141,6 +148,21 @@ BASE_GNNPLUS_CKPT = PROJECT_ROOT / "results" / "gnn_plus_retrained_fixedk40" / "
 BASELINE_OUTPUT_DIR = PROJECT_ROOT / "results" / "professor_clean_gnnplus_zeroshot"
 HELPER_PATH = PROJECT_ROOT / "scripts" / "build_gnnplus_packet_sdn_report_fixed.py"
 RUNNER_PATH = PROJECT_ROOT / "scripts" / "run_gnnplus_packet_sdn_full.py"
+
+
+def feature_profile_description() -> str:
+    if FEATURE_VARIANT == "lightweight_failure_aware":
+        return (
+            "Lightweight failure-aware physical profile: keeps bottleneck perception, OD-level failure signals, "
+            "and absolute stress-change features while pruning the broader topology-style and weaker temporal extras."
+        )
+    if FEATURE_VARIANT == "section7_temporal":
+        return (
+            "Temporal disturbance-aware profile: keeps the physical features and adds previous-selection and previous-disturbance cues."
+        )
+    if FEATURE_VARIANT == "section3_physical":
+        return "Physical/stress-aware profile without the temporal continuity cues."
+    return "Legacy GNN+ feature profile."
 
 
 def seed_all(seed: int) -> None:
@@ -186,8 +208,8 @@ def topk_from_soft_target(soft_target: np.ndarray, k: int) -> list[int]:
     return order[: min(int(k), int(order.size))].astype(int).tolist()
 
 
-def build_section7_inputs(sample: dict, *, device: str):
-    graph_data = build_graph_tensors_plus_section7(
+def build_experiment_inputs(sample: dict, *, device: str):
+    graph_data = build_graph_tensors_plus(
         sample["dataset"],
         tm_vector=sample["tm_vector"],
         path_library=sample["path_library"],
@@ -196,9 +218,10 @@ def build_section7_inputs(sample: dict, *, device: str):
         prev_tm=sample["prev_tm"],
         prev_selected_indicator=sample["prev_selected_indicator"],
         prev_disturbance=sample["prev_disturbance"],
+        feature_variant=FEATURE_VARIANT,
         device=device,
     )
-    od_data = build_od_features_plus_section7(
+    od_data = build_od_features_plus(
         sample["dataset"],
         sample["tm_vector"],
         sample["path_library"],
@@ -208,6 +231,7 @@ def build_section7_inputs(sample: dict, *, device: str):
         prev_selected_indicator=sample["prev_selected_indicator"],
         prev_disturbance=sample["prev_disturbance"],
         failure_mask=sample.get("failure_mask"),
+        feature_variant=FEATURE_VARIANT,
         device=device,
     )
     return graph_data, od_data
@@ -256,7 +280,7 @@ def materialize_scheduled_history(
                 scheduled["prev_selected_indicator"] = np.asarray(prev_indicator, dtype=np.float32)
                 materialized.append(scheduled)
 
-                graph_data, od_data = build_section7_inputs(scheduled, device=DEVICE)
+                graph_data, od_data = build_experiment_inputs(scheduled, device=DEVICE)
                 scores, _, _ = model(graph_data, od_data)
                 selected, _, _ = continuity_select(
                     scores,
@@ -442,7 +466,7 @@ def collect_split_samples(
 def build_initial_gnnplus_model() -> GNNPlusFlowSelector:
     if BASE_GNNPLUS_CKPT.exists():
         model, _ = load_gnn_plus(BASE_GNNPLUS_CKPT, device=DEVICE)
-        model.cfg.feature_variant = "section7_temporal"
+        model.cfg.feature_variant = FEATURE_VARIANT
         model.cfg.device = DEVICE
         model.cfg.learn_k_crit = False
         model.cfg.k_crit_min = K_CRIT
@@ -455,7 +479,7 @@ def build_initial_gnnplus_model() -> GNNPlusFlowSelector:
         learn_k_crit=False,
         k_crit_min=K_CRIT,
         k_crit_max=K_CRIT,
-        feature_variant="section7_temporal",
+        feature_variant=FEATURE_VARIANT,
         device=DEVICE,
     )
     return GNNPlusFlowSelector(cfg).to(DEVICE)
@@ -496,7 +520,7 @@ def run_supervised_training(train_samples: list[dict], val_samples: list[dict]):
 
         for idx in order:
             sample = epoch_train_samples[int(idx)]
-            graph_data, od_data = build_section7_inputs(sample, device=DEVICE)
+            graph_data, od_data = build_experiment_inputs(sample, device=DEVICE)
             scores, _, _ = model(graph_data, od_data)
 
             num_od = scores.size(0)
@@ -527,7 +551,7 @@ def run_supervised_training(train_samples: list[dict], val_samples: list[dict]):
         val_overlap = []
         with torch.no_grad():
             for sample in epoch_val_samples:
-                graph_data, od_data = build_section7_inputs(sample, device=DEVICE)
+                graph_data, od_data = build_experiment_inputs(sample, device=DEVICE)
                 scores, _, _ = model(graph_data, od_data)
                 num_od = scores.size(0)
                 oracle_mask = torch.zeros(num_od, device=DEVICE)
@@ -583,6 +607,7 @@ def run_supervised_training(train_samples: list[dict], val_samples: list[dict]):
                 extra_meta={
                     "stage": "section3_4_7_supervised_finetune",
                     "base_checkpoint": str(BASE_GNNPLUS_CKPT.relative_to(PROJECT_ROOT)),
+                    "feature_variant": FEATURE_VARIANT,
                     "best_epoch": best_epoch,
                     "best_val_loss": best_val_loss,
                 },
@@ -603,7 +628,8 @@ def run_supervised_training(train_samples: list[dict], val_samples: list[dict]):
         "num_val_samples": int(len(val_samples)),
         "training_time_sec": float(time.perf_counter() - start),
         "continuity_bonus": float(CONTINUITY_BONUS),
-        "feature_variant": "section7_temporal",
+        "feature_variant": FEATURE_VARIANT,
+        "feature_profile": feature_profile_description(),
         "soft_teacher_weight": SOFT_TEACHER_WEIGHT,
         "criticality_weight": CRITICALITY_WEIGHT,
     }
@@ -623,13 +649,13 @@ def run_rl_finetune(model: GNNPlusFlowSelector, train_samples: list[dict], val_s
         max_epochs=RL_MAX_EPOCHS,
         patience=RL_PATIENCE,
         baseline_ema=0.9,
-        w_reward_mlu=1.15,
-        w_reward_improvement=0.85,
-        w_reward_disturbance=0.15,
+        w_reward_mlu=REWARD_MLU,
+        w_reward_improvement=REWARD_IMPROVEMENT,
+        w_reward_disturbance=REWARD_DISTURBANCE,
         w_reward_infeasible=2.0,
-        w_reward_vs_bottleneck=0.45,
-        w_reward_vs_reference=0.15,
-        w_reward_bottleneck_margin=0.10,
+        w_reward_vs_bottleneck=REWARD_VS_BOTTLENECK,
+        w_reward_vs_reference=REWARD_VS_REFERENCE,
+        w_reward_bottleneck_margin=REWARD_BOTTLENECK_MARGIN,
         rank_loss_weight=0.25,
         score_margin_weight=0.08,
         infeasible_mlu_penalty=10.0,
@@ -672,7 +698,7 @@ def run_rl_finetune(model: GNNPlusFlowSelector, train_samples: list[dict], val_s
 
         for idx in order:
             sample = epoch_train_samples[int(idx)]
-            graph_data, od_data = build_section7_inputs(sample, device=DEVICE)
+            graph_data, od_data = build_experiment_inputs(sample, device=DEVICE)
             scores, _, _ = model(graph_data, od_data)
 
             selected_ods, ranking_scores, selected_log_prob = continuity_select(
@@ -787,7 +813,7 @@ def run_rl_finetune(model: GNNPlusFlowSelector, train_samples: list[dict], val_s
         val_mlus = []
         with torch.no_grad():
             for sample in epoch_val_samples:
-                graph_data, od_data = build_section7_inputs(sample, device=DEVICE)
+                graph_data, od_data = build_experiment_inputs(sample, device=DEVICE)
                 scores, _, _ = model(graph_data, od_data)
                 selected_ods, _, _ = continuity_select(
                     scores,
@@ -837,7 +863,7 @@ def run_rl_finetune(model: GNNPlusFlowSelector, train_samples: list[dict], val_s
             best_val_mlu = mean_val_mlu
             best_epoch = epoch
             stale = 0
-            model.cfg.feature_variant = "section7_temporal"
+            model.cfg.feature_variant = FEATURE_VARIANT
             model.cfg.learn_k_crit = False
             model.cfg.k_crit_min = K_CRIT
             model.cfg.k_crit_max = K_CRIT
@@ -848,6 +874,7 @@ def run_rl_finetune(model: GNNPlusFlowSelector, train_samples: list[dict], val_s
                     "stage": "section3_4_5_7_reinforce_finetune",
                     "base_checkpoint": str(BASE_GNNPLUS_CKPT.relative_to(PROJECT_ROOT)),
                     "supervised_checkpoint": str(SUP_CKPT.relative_to(PROJECT_ROOT)),
+                    "feature_variant": FEATURE_VARIANT,
                     "best_epoch": best_epoch,
                     "best_val_mlu": best_val_mlu,
                     "rl_config": asdict(rl_cfg),
@@ -887,7 +914,7 @@ def gnnplus_select_stateful(
     k_crit: int,
     failure_mask=None,
 ):
-    graph_data = build_graph_tensors_plus_section7(
+    graph_data = build_graph_tensors_plus(
         dataset,
         tm_vector=tm_vector,
         path_library=path_library,
@@ -897,9 +924,10 @@ def gnnplus_select_stateful(
         prev_selected_indicator=prev_selected_indicator,
         prev_disturbance=prev_disturbance,
         failure_mask=failure_mask,
+        feature_variant=FEATURE_VARIANT,
         device=DEVICE,
     )
-    od_data = build_od_features_plus_section7(
+    od_data = build_od_features_plus(
         dataset,
         tm_vector,
         path_library,
@@ -909,6 +937,7 @@ def gnnplus_select_stateful(
         prev_selected_indicator=prev_selected_indicator,
         prev_disturbance=prev_disturbance,
         failure_mask=failure_mask,
+        feature_variant=FEATURE_VARIANT,
         device=DEVICE,
     )
     active_mask = ((np.asarray(tm_vector, dtype=np.float64) > 1e-12) & surviving_od_mask(path_library)).astype(np.float32)
@@ -1320,7 +1349,17 @@ def build_split_manifest() -> dict:
             "section7_disturbance_aware_temporal_path": True,
         },
         "fixed_k": K_CRIT,
+        "feature_variant": FEATURE_VARIANT,
+        "feature_profile": feature_profile_description(),
         "continuity_bonus": CONTINUITY_BONUS,
+        "reward_profile": {
+            "w_reward_mlu": REWARD_MLU,
+            "w_reward_improvement": REWARD_IMPROVEMENT,
+            "w_reward_disturbance": REWARD_DISTURBANCE,
+            "w_reward_vs_bottleneck": REWARD_VS_BOTTLENECK,
+            "w_reward_vs_reference": REWARD_VS_REFERENCE,
+            "w_reward_bottleneck_margin": REWARD_BOTTLENECK_MARGIN,
+        },
         "base_checkpoint": str(BASE_GNNPLUS_CKPT.relative_to(PROJECT_ROOT)),
     }
 
@@ -1388,7 +1427,7 @@ def build_comparison_tables(summary_df: pd.DataFrame, failure_df: pd.DataFrame) 
                 "gnnplus_mean_decision_time_ms": float(old_summary[old_summary["method"] == "gnnplus"]["decision_time_ms"].mean()),
             },
             {
-                "bundle": "improved_fixedk40_experiment",
+                "bundle": EXPERIMENT_TAG,
                 "gnnplus_mean_mlu": float(summary_df[summary_df["method"] == "gnnplus"]["mean_mlu"].mean()),
                 "gnnplus_mean_throughput": float(summary_df[summary_df["method"] == "gnnplus"]["throughput"].mean()),
                 "gnnplus_mean_disturbance": float(summary_df[summary_df["method"] == "gnnplus"]["mean_disturbance"].mean()),
@@ -1411,7 +1450,7 @@ def add_title_page(doc: Document) -> None:
         doc.add_paragraph()
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run("GNN+ Roadmap Step1-6 Zero-Shot Report")
+    run = title.add_run(os.environ.get("GNNPLUS_REPORT_TITLE", "GNN+ Roadmap Step1-6 Zero-Shot Report"))
     run.bold = True
     run.font.size = Pt(22)
     run.font.color.rgb = RGBColor(0x1A, 0x47, 0x80)
@@ -1420,6 +1459,7 @@ def add_title_page(doc: Document) -> None:
     sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = sub.add_run(
         "Scope: ECMP, Bottleneck, Original GNN, GNN+\n"
+        f"Feature profile: {FEATURE_VARIANT}\n"
         "Enhancements: Sections 3, 4, 5, and 7\n"
         "No MetaGate, No Stable MetaGate, No Bayesian Calibration"
     )
@@ -1476,14 +1516,16 @@ def build_report(summary_df: pd.DataFrame, failure_df: pd.DataFrame, metrics_df:
     add_bullet(doc, "Known training topologies remain the original six known topologies.")
     add_bullet(doc, "Germany50 and VtlWavenet2011 remain unseen zero-shot evaluation topologies.")
     add_bullet(doc, "No MetaGate, Stable MetaGate, Bayesian calibration, or per-topology adaptation is used.")
+    add_bullet(doc, f"Active feature profile: {feature_profile_description()}")
 
     doc.add_heading("2. Improvements Enabled", level=1)
     improvements = pd.DataFrame(
         [
+            {"Section": "1", "Change": f"Feature pruning profile ({FEATURE_VARIANT})", "Enabled": "Yes"},
             {"Section": "3", "Change": "Physical/stress-aware features", "Enabled": "Yes"},
             {"Section": "4", "Change": "Soft teacher targets + continuous criticality", "Enabled": "Yes"},
             {"Section": "5", "Change": "RL fine-tuning with MLU/improvement/disturbance reward", "Enabled": "Yes"},
-            {"Section": "7", "Change": "Temporal disturbance-aware features + continuity bonus", "Enabled": "Yes"},
+            {"Section": "7", "Change": "Scheduled-sampling temporal path + continuity bonus", "Enabled": "Yes"},
             {"Section": "6", "Change": f"Fixed K = {K_CRIT} main thesis branch", "Enabled": "Yes"},
         ]
     )
@@ -1495,7 +1537,11 @@ def build_report(summary_df: pd.DataFrame, failure_df: pd.DataFrame, metrics_df:
             {"Field": "Base checkpoint", "Value": training_summary["base_checkpoint"]},
             {"Field": "Final checkpoint", "Value": training_summary["final_checkpoint"]},
             {"Field": "Feature variant", "Value": training_summary["feature_variant"]},
+            {"Field": "Feature profile", "Value": training_summary["supervised"]["feature_profile"]},
             {"Field": "Continuity bonus", "Value": training_summary["continuity_bonus"]},
+            {"Field": "Reward w_mlu", "Value": training_summary["reinforce"]["rl_config"]["w_reward_mlu"]},
+            {"Field": "Reward w_improvement", "Value": training_summary["reinforce"]["rl_config"]["w_reward_improvement"]},
+            {"Field": "Reward w_disturbance", "Value": training_summary["reinforce"]["rl_config"]["w_reward_disturbance"]},
             {"Field": "Supervised train samples", "Value": training_summary["supervised"]["num_train_samples"]},
             {"Field": "Supervised val samples", "Value": training_summary["supervised"]["num_val_samples"]},
             {"Field": "RL train samples", "Value": training_summary["reinforce"]["num_train_samples"]},
@@ -1661,7 +1707,8 @@ def main() -> int:
     training_summary = {
         "base_checkpoint": str(BASE_GNNPLUS_CKPT.relative_to(PROJECT_ROOT)),
         "final_checkpoint": str(FINAL_CKPT.relative_to(PROJECT_ROOT)),
-        "feature_variant": "section7_temporal",
+        "feature_variant": FEATURE_VARIANT,
+        "feature_profile": feature_profile_description(),
         "continuity_bonus": CONTINUITY_BONUS,
         "supervised": supervised_summary,
         "reinforce": reinforce_summary,

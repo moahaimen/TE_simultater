@@ -53,7 +53,12 @@ class GNNPlusConfig(GNNSelectorConfig):
 
 
 _PLUS_TOPOLOGY_CACHE: Dict[tuple, Dict[str, object]] = {}
-_FEATURE_VARIANTS = {"legacy", "section3_physical", "section7_temporal"}
+_FEATURE_VARIANTS = {
+    "legacy",
+    "section3_physical",
+    "section7_temporal",
+    "lightweight_failure_aware",
+}
 
 
 def _normalize_feature_variant(feature_variant: Optional[str]) -> str:
@@ -103,6 +108,27 @@ def _compute_clustering(adjacency: np.ndarray) -> np.ndarray:
     return clustering
 
 
+def _ensure_legacy_graph_cache(cache: Dict[str, object]) -> Dict[str, object]:
+    """Materialize adjacency-only legacy helpers on demand.
+
+    The lighter zero-shot variants do not use dense adjacency or clustering, so
+    avoid building them unless the legacy feature profile is explicitly chosen.
+    """
+    if all(key in cache for key in ("adjacency", "neighbor_counts", "clustering")):
+        return cache
+
+    num_nodes = int(cache["num_nodes"])
+    src_idx = np.asarray(cache["src_idx"], dtype=np.int64)
+    dst_idx = np.asarray(cache["dst_idx"], dtype=np.int64)
+    adjacency = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+    adjacency[src_idx, dst_idx] = 1.0
+    adjacency[dst_idx, src_idx] = 1.0
+    cache["adjacency"] = adjacency
+    cache["neighbor_counts"] = np.sum(adjacency, axis=1)
+    cache["clustering"] = _compute_clustering(adjacency)
+    return cache
+
+
 def _get_plus_topology_cache(dataset, path_library) -> Dict[str, object]:
     key = _topology_cache_key(dataset, path_library)
     cached = _PLUS_TOPOLOGY_CACHE.get(key)
@@ -117,12 +143,6 @@ def _get_plus_topology_cache(dataset, path_library) -> Dict[str, object]:
     src_idx = np.asarray([node_to_idx[src] for src, _ in dataset.edges], dtype=np.int64)
     dst_idx = np.asarray([node_to_idx[dst] for _, dst in dataset.edges], dtype=np.int64)
     edge_index_np = np.stack([src_idx, dst_idx], axis=0)
-
-    adjacency = np.zeros((num_nodes, num_nodes), dtype=np.float32)
-    adjacency[src_idx, dst_idx] = 1.0
-    adjacency[dst_idx, src_idx] = 1.0
-    neighbor_counts = np.sum(adjacency, axis=1)
-    clustering = _compute_clustering(adjacency)
 
     od_src = np.asarray([node_to_idx[src] for src, _ in path_library.od_pairs], dtype=np.int64)
     od_dst = np.asarray([node_to_idx[dst] for _, dst in path_library.od_pairs], dtype=np.int64)
@@ -155,10 +175,9 @@ def _get_plus_topology_cache(dataset, path_library) -> Dict[str, object]:
 
     cached = {
         "node_to_idx": node_to_idx,
+        "src_idx": src_idx,
+        "dst_idx": dst_idx,
         "edge_index_np": edge_index_np,
-        "adjacency": adjacency,
-        "neighbor_counts": neighbor_counts,
-        "clustering": clustering,
         "od_src": od_src,
         "od_dst": od_dst,
         "path_costs": path_costs,
@@ -222,8 +241,12 @@ def build_graph_tensors_plus(
     src_idx = np.asarray(cache["edge_index_np"][0], dtype=np.int64)
     dst_idx = np.asarray(cache["edge_index_np"][1], dtype=np.int64)
     edge_index = torch.tensor(cache["edge_index_np"], dtype=torch.long, device=dev)
-    adjacency = np.asarray(cache["adjacency"], dtype=np.float64)
-    neighbor_counts = np.asarray(cache["neighbor_counts"], dtype=np.float64)
+    adjacency = None
+    neighbor_counts = None
+    if variant == "legacy":
+        legacy_cache = _ensure_legacy_graph_cache(cache)
+        adjacency = np.asarray(legacy_cache["adjacency"], dtype=np.float64)
+        neighbor_counts = np.asarray(legacy_cache["neighbor_counts"], dtype=np.float64)
 
     # --- Base edge features (same as original) ---
     cap_norm = capacities / (np.max(capacities) + 1e-12)
@@ -336,8 +359,10 @@ def build_graph_tensors_plus(
     demand_through_node_norm = demand_through_node / (np.max(demand_through_node) + 1e-12)
 
     # 13: congested_neighbor_fraction (legacy only)
-    congested_nodes = ((max_util_in > 0.8) | (max_util_out > 0.8)).astype(np.float64)
-    congested_neighbor_frac = (adjacency @ congested_nodes) / np.maximum(neighbor_counts, 1.0)
+    congested_neighbor_frac = np.zeros(num_nodes, dtype=np.float64)
+    if variant == "legacy" and adjacency is not None and neighbor_counts is not None:
+        congested_nodes = ((max_util_in > 0.8) | (max_util_out > 0.8)).astype(np.float64)
+        congested_neighbor_frac = (adjacency @ congested_nodes) / np.maximum(neighbor_counts, 1.0)
 
     # 14: max_residual_capacity on incident edges
     max_residual_cap = np.zeros(num_nodes, dtype=np.float64)
@@ -346,7 +371,11 @@ def build_graph_tensors_plus(
     max_residual_cap_norm = max_residual_cap / (np.max(max_residual_cap) + 1e-12)
 
     # 15: clustering coefficient proxy (legacy only)
-    clustering = np.asarray(cache["clustering"], dtype=np.float64)
+    clustering = (
+        np.asarray(_ensure_legacy_graph_cache(cache)["clustering"], dtype=np.float64)
+        if variant == "legacy"
+        else np.zeros(num_nodes, dtype=np.float64)
+    )
 
     # Section 3 stress-change replacements
     node_abs_util_delta = np.zeros(num_nodes, dtype=np.float64)
@@ -378,6 +407,13 @@ def build_graph_tensors_plus(
         node_tail_feature = clustering
     elif variant == "section3_physical":
         node_neighbor_feature = node_abs_util_delta_norm
+        node_tail_feature = node_abs_demand_delta_norm
+    elif variant == "lightweight_failure_aware":
+        node_neighbor_feature = np.clip(
+            0.80 * node_abs_util_delta_norm + 0.20 * fail_exposure,
+            0.0,
+            1.0,
+        )
         node_tail_feature = node_abs_demand_delta_norm
     else:
         node_neighbor_feature = np.clip(
@@ -582,14 +618,15 @@ def build_od_features_plus(
     # 13: dst_congestion
     dst_congestion = max_util_in[od_dst]
 
-    # 14: path_overlap_score — fraction of best-path edges shared with other active ODs
-    # Build edge usage count across active ODs
-    edge_od_count = ((tm > 1e-12).astype(np.float32) @ np.asarray(cache["best_path_incidence"], dtype=np.float32)).astype(np.float64)
     path_overlap = np.zeros(num_od, dtype=np.float64)
-    shared_edge_mask = (edge_od_count > 1.0).astype(np.float32)
-    overlap_mass = np.asarray(cache["best_path_incidence"], dtype=np.float32) @ shared_edge_mask
-    valid_hops = hop_count > 0
-    path_overlap[valid_hops] = overlap_mass[valid_hops] / hop_count[valid_hops]
+    if variant == "legacy":
+        edge_od_count = (
+            (tm > 1e-12).astype(np.float32) @ np.asarray(cache["best_path_incidence"], dtype=np.float32)
+        ).astype(np.float64)
+        shared_edge_mask = (edge_od_count > 1.0).astype(np.float32)
+        overlap_mass = np.asarray(cache["best_path_incidence"], dtype=np.float32) @ shared_edge_mask
+        valid_hops = hop_count > 0
+        path_overlap[valid_hops] = overlap_mass[valid_hops] / hop_count[valid_hops]
 
     # 15: bottleneck perception / congestion pressure
     bn_scores = tm * bottleneck_util
@@ -619,6 +656,24 @@ def build_od_features_plus(
         od_tail_feature = demand_delta_abs_norm
         path_count_feature = num_paths_norm
         congestion_feature = ecmp_contribution
+    elif variant == "lightweight_failure_aware":
+        od_stress_feature = np.clip(
+            0.50 * bottleneck_delta_abs_norm
+            + 0.30 * path_set_shrink_ratio
+            + 0.20 * prev_best_invalid_flag,
+            0.0,
+            1.0,
+        )
+        od_tail_feature = np.clip(
+            0.65 * demand_delta_abs_norm
+            + 0.20 * path_set_shrink_ratio
+            + 0.15 * prev_best_invalid_flag,
+            0.0,
+            1.0,
+        )
+        path_count_feature = surviving_paths_norm
+        congestion_feature = np.clip(0.80 * bottleneck_perception + 0.20 * ecmp_contribution, 0.0, 1.0)
+        demand_change_feature = np.clip(0.55 * demand_change + 0.45 * path_set_shrink_ratio, 0.0, 1.0)
     else:
         od_stress_feature = np.clip(
             0.55 * bottleneck_delta_abs_norm + 0.25 * prev_selected + 0.20 * prev_best_invalid_flag,
@@ -862,5 +917,45 @@ def build_od_features_plus_section7(
         prev_disturbance=prev_disturbance,
         failure_mask=failure_mask,
         feature_variant="section7_temporal",
+        device=device,
+    )
+
+
+def build_graph_tensors_plus_light(
+    dataset, tm_vector=None, path_library=None,
+    telemetry=None, failure_mask=None,
+    prev_util=None, prev_tm=None,
+    device="cpu",
+):
+    """Lighter failure-aware graph features for fixed-K zero-shot experiments."""
+    return build_graph_tensors_plus(
+        dataset,
+        tm_vector=tm_vector,
+        path_library=path_library,
+        telemetry=telemetry,
+        failure_mask=failure_mask,
+        prev_util=prev_util,
+        prev_tm=prev_tm,
+        feature_variant="lightweight_failure_aware",
+        device=device,
+    )
+
+
+def build_od_features_plus_light(
+    dataset, tm_vector, path_library,
+    telemetry=None, prev_tm=None, prev_util=None,
+    failure_mask=None,
+    device="cpu",
+):
+    """Lighter failure-aware OD features for fixed-K zero-shot experiments."""
+    return build_od_features_plus(
+        dataset,
+        tm_vector,
+        path_library,
+        telemetry=telemetry,
+        prev_tm=prev_tm,
+        prev_util=prev_util,
+        failure_mask=failure_mask,
+        feature_variant="lightweight_failure_aware",
         device=device,
     )
