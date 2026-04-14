@@ -923,6 +923,12 @@ def gnnplus_select_stateful(
     k_crit: int,
     failure_mask=None,
 ):
+    has_active_failure = bool(
+        failure_mask is not None and np.any(np.asarray(failure_mask, dtype=np.float64) > 0.5)
+    )
+    effective_prev_selected_indicator = None if has_active_failure else prev_selected_indicator
+    effective_prev_disturbance = 0.0 if has_active_failure else prev_disturbance
+    effective_continuity_bonus = 0.0 if has_active_failure else CONTINUITY_BONUS
     graph_data = build_graph_tensors_plus(
         dataset,
         tm_vector=tm_vector,
@@ -930,8 +936,8 @@ def gnnplus_select_stateful(
         telemetry=telemetry,
         prev_util=prev_util,
         prev_tm=prev_tm,
-        prev_selected_indicator=prev_selected_indicator,
-        prev_disturbance=prev_disturbance,
+        prev_selected_indicator=effective_prev_selected_indicator,
+        prev_disturbance=effective_prev_disturbance,
         failure_mask=failure_mask,
         feature_variant=FEATURE_VARIANT,
         device=DEVICE,
@@ -943,8 +949,8 @@ def gnnplus_select_stateful(
         telemetry=telemetry,
         prev_tm=prev_tm,
         prev_util=prev_util,
-        prev_selected_indicator=prev_selected_indicator,
-        prev_disturbance=prev_disturbance,
+        prev_selected_indicator=effective_prev_selected_indicator,
+        prev_disturbance=effective_prev_disturbance,
         failure_mask=failure_mask,
         feature_variant=FEATURE_VARIANT,
         device=DEVICE,
@@ -956,8 +962,8 @@ def gnnplus_select_stateful(
         active_mask=active_mask,
         k_crit_default=k_crit,
         force_default_k=True,
-        prev_selected_indicator=prev_selected_indicator,
-        continuity_bonus=CONTINUITY_BONUS,
+        prev_selected_indicator=effective_prev_selected_indicator,
+        continuity_bonus=effective_continuity_bonus,
     )
     assert_selected_ods_have_paths(path_library, selected, context=f"{dataset.key}:gnnplus_improved")
     return selected, info

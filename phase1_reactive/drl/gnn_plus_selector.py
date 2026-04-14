@@ -149,6 +149,16 @@ def _float_tensor_from_numpy(array: np.ndarray, device: torch.device) -> torch.T
     return tensor if device.type == "cpu" else tensor.to(device=device)
 
 
+def _path_hits_failure_mask(edge_path: Sequence[int], fail_mask: np.ndarray) -> bool:
+    return any(fail_mask[int(edge_idx)] > 0.5 for edge_idx in edge_path)
+
+
+def _has_active_failure_mask(fail_mask: Optional[np.ndarray]) -> bool:
+    if fail_mask is None:
+        return False
+    return bool(np.any(np.asarray(fail_mask, dtype=np.float64) > 0.5))
+
+
 def _get_plus_topology_cache(dataset, path_library) -> Dict[str, object]:
     key = _topology_cache_key(dataset, path_library)
     cached = _PLUS_TOPOLOGY_CACHE.get(key)
@@ -372,6 +382,7 @@ def build_graph_tensors_plus(
         np.add.at(fail_exposure, src_idx, (fail > 0.5).astype(np.float64))
         np.add.at(fail_exposure, dst_idx, (fail > 0.5).astype(np.float64))
         fail_exposure = fail_exposure / (total_degree + 1e-12)
+    has_active_failure = _has_active_failure_mask(fail)
 
     # --- NEW node features (replacing placeholders 12-15) ---
 
@@ -420,12 +431,16 @@ def build_graph_tensors_plus(
         np.add.at(node_abs_demand_delta, np.asarray(cache["od_dst"], dtype=np.int64), demand_delta)
     node_abs_demand_delta_norm = node_abs_demand_delta / (np.max(node_abs_demand_delta) + 1e-12)
     prev_selected = _normalize_prev_selected_indicator(prev_selected_indicator, num_od)
+    if has_active_failure:
+        prev_selected = np.zeros_like(prev_selected)
     node_prev_selected_mass = np.zeros(num_nodes, dtype=np.float64)
     if prev_selected.size:
         np.add.at(node_prev_selected_mass, np.asarray(cache["od_src"], dtype=np.int64), prev_selected)
         np.add.at(node_prev_selected_mass, np.asarray(cache["od_dst"], dtype=np.int64), prev_selected)
     node_prev_selected_mass_norm = node_prev_selected_mass / (np.max(node_prev_selected_mass) + 1e-12)
     prev_dist_scalar = float(np.clip(prev_disturbance, 0.0, 1.0))
+    if has_active_failure:
+        prev_dist_scalar = 0.0
 
     if variant == "legacy":
         node_neighbor_feature = congested_neighbor_frac
@@ -552,7 +567,7 @@ def build_od_features_plus(
         src = np.asarray(telemetry.failure_mask, dtype=np.float64).reshape(-1)
         fail_mask[: min(num_edges, src.size)] = src[: min(num_edges, src.size)]
 
-    has_active_failure = bool(np.sum(fail_mask) > 0.5)
+    has_active_failure = _has_active_failure_mask(fail_mask)
     alt_path_headroom = np.zeros(num_od, dtype=np.float64)
     surviving_best_headroom = np.zeros(num_od, dtype=np.float64)
     surviving_path_count = num_paths.copy()
@@ -567,14 +582,11 @@ def build_od_features_plus(
         if has_active_failure:
             surviving_paths: list[list[int]] = []
             if best_path_edges:
-                prev_best_invalid_flag[od_idx] = float(
-                    np.any(fail_mask[np.asarray(best_path_edges, dtype=np.int64)] > 0.5)
-                )
+                prev_best_invalid_flag[od_idx] = float(_path_hits_failure_mask(best_path_edges, fail_mask))
             for edge_path in all_paths:
                 if not edge_path:
                     continue
-                edge_idx = np.asarray(edge_path, dtype=np.int64)
-                if edge_idx.size == 0 or np.any(fail_mask[edge_idx] > 0.5):
+                if _path_hits_failure_mask(edge_path, fail_mask):
                     continue
                 surviving_paths.append(list(edge_path))
 
@@ -672,7 +684,11 @@ def build_od_features_plus(
     bottleneck_delta_abs_norm = bottleneck_delta_abs / (np.max(bottleneck_delta_abs) + 1e-12)
     demand_delta_abs_norm = demand_delta_abs / (np.max(demand_delta_abs) + 1e-12)
     prev_selected = _normalize_prev_selected_indicator(prev_selected_indicator, num_od)
+    if has_active_failure:
+        prev_selected = np.zeros_like(prev_selected)
     prev_dist_scalar = float(np.clip(prev_disturbance, 0.0, 1.0))
+    if has_active_failure:
+        prev_dist_scalar = 0.0
     demand_change_feature = np.clip(0.70 * demand_change + 0.30 * path_set_shrink_ratio, 0.0, 1.0)
 
     if variant == "legacy":
