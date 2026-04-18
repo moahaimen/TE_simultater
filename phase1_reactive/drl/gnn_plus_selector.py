@@ -149,6 +149,11 @@ def _float_tensor_from_numpy(array: np.ndarray, device: torch.device) -> torch.T
     return tensor if device.type == "cpu" else tensor.to(device=device)
 
 
+def _long_tensor_from_numpy(array: np.ndarray, device: torch.device) -> torch.Tensor:
+    tensor = torch.from_numpy(np.ascontiguousarray(array.astype(np.int64, copy=False))).long()
+    return tensor if device.type == "cpu" else tensor.to(device=device)
+
+
 def _path_hits_failure_mask(edge_path: Sequence[int], fail_mask: np.ndarray) -> bool:
     return any(fail_mask[int(edge_idx)] > 0.5 for edge_idx in edge_path)
 
@@ -215,6 +220,8 @@ def _get_plus_topology_cache(dataset, path_library) -> Dict[str, object]:
         "hop_count": hop_count,
         "best_path_edges_list": best_path_edges_list,
         "best_path_incidence": best_path_incidence,
+        "best_path_incidence_bool": best_path_incidence > 0.0,
+        "best_path_incidence_u8": best_path_incidence.astype(np.uint8, copy=False),
         "all_path_edge_count_by_od": all_path_edge_count_by_od,
         "alt_edge_paths": alt_edge_paths,
         "num_nodes": num_nodes,
@@ -268,8 +275,8 @@ def build_graph_tensors_plus(
     num_edges = int(cache["num_edges"])
     num_od = len(path_library.od_pairs)
     node_to_idx = cache["node_to_idx"]
-    src_idx = np.asarray(cache["edge_index_np"][0], dtype=np.int64)
-    dst_idx = np.asarray(cache["edge_index_np"][1], dtype=np.int64)
+    src_idx = np.asarray(cache["src_idx"], dtype=np.int64)
+    dst_idx = np.asarray(cache["dst_idx"], dtype=np.int64)
     edge_index = _cached_long_tensor(
         cache,
         tensor_key="edge_index_tensor_cpu",
@@ -336,17 +343,15 @@ def build_graph_tensors_plus(
     is_bottleneck = np.zeros(num_edges, dtype=np.float64)
     if path_library is not None and tm_vector is not None:
         tm = np.asarray(tm_vector, dtype=np.float64)
-        for od_idx in np.flatnonzero(tm > 1e-12):
-            path_edges = cache["best_path_edges_list"][int(od_idx)]
-            if not path_edges:
-                continue
-            path_utils = util[np.asarray(path_edges, dtype=np.int64)]
-            if path_utils.size == 0:
-                continue
-            max_u = float(np.max(path_utils))
-            for eidx in path_edges:
-                if util[int(eidx)] >= max_u - 1e-12:
-                    is_bottleneck[int(eidx)] = 1.0
+        active_rows = np.flatnonzero(tm > 1e-12)
+        if active_rows.size:
+            incidence = np.asarray(cache["best_path_incidence_bool"], dtype=bool)[active_rows]
+            if incidence.size:
+                util_view = util.reshape(1, -1)
+                path_utils = np.where(incidence, util_view, -np.inf)
+                max_u = np.max(path_utils, axis=1, initial=-np.inf)
+                at_bottleneck = incidence & (util_view >= (max_u[:, None] - 1e-12))
+                is_bottleneck = np.any(at_bottleneck, axis=0).astype(np.float64, copy=False)
 
     edge_stress_feature = load_change if variant == "legacy" else util_delta_abs_norm
 
@@ -355,6 +360,12 @@ def build_graph_tensors_plus(
         od_per_edge_norm, residual_cap_norm, edge_stress_feature, is_bottleneck,
     ], axis=1).astype(np.float32)
     edge_features = _float_tensor_from_numpy(edge_feat, dev)
+    disruption_signal = 0.0
+    if prev_util is not None:
+        disruption_signal = float(np.mean(util_delta_abs))
+    if np.any(fail > 0.5):
+        disruption_signal = max(disruption_signal, float(np.mean(fail > 0.5)))
+    disruption_signal = float(np.clip(disruption_signal, 0.0, 1.0))
 
     # --- Node features (fill placeholders 12-15 with real features) ---
     in_degree = np.bincount(dst_idx, minlength=num_nodes).astype(np.float64)
@@ -492,6 +503,7 @@ def build_graph_tensors_plus(
         "node_features": node_features,
         "edge_index": edge_index,
         "edge_features": edge_features,
+        "disruption_signal": disruption_signal,
         "node_to_idx": node_to_idx,
         "num_nodes": num_nodes,
         "num_edges": num_edges,
@@ -503,6 +515,7 @@ def build_od_features_plus(
     telemetry=None, prev_tm=None, prev_util=None,
     prev_selected_indicator=None, prev_disturbance=0.0,
     failure_mask=None,
+    candidate_od_indices=None,
     feature_variant="legacy",
     device="cpu",
 ):
@@ -527,21 +540,30 @@ def build_od_features_plus(
     num_od = len(path_library.od_pairs)
     num_edges = len(dataset.edges)
     num_nodes = len(dataset.nodes)
+    if candidate_od_indices is None:
+        od_indices = np.arange(num_od, dtype=np.int64)
+    else:
+        od_indices = np.asarray(candidate_od_indices, dtype=np.int64).reshape(-1)
+        od_indices = od_indices[(od_indices >= 0) & (od_indices < num_od)]
+        if od_indices.size == 0:
+            od_indices = np.arange(num_od, dtype=np.int64)
+    num_eval_od = int(od_indices.size)
 
-    tm = np.asarray(tm_vector, dtype=np.float64)
+    tm_full = np.asarray(tm_vector, dtype=np.float64)
+    tm = tm_full[od_indices]
     tm_norm = tm / (np.max(tm) + 1e-12)
 
-    od_src = np.asarray(cache["od_src"], dtype=np.int64)
-    od_dst = np.asarray(cache["od_dst"], dtype=np.int64)
+    od_src = np.asarray(cache["od_src"], dtype=np.int64)[od_indices]
+    od_dst = np.asarray(cache["od_dst"], dtype=np.int64)[od_indices]
 
     # --- Original features ---
-    path_costs = np.asarray(cache["path_costs"], dtype=np.float64).copy()
-    num_paths = np.asarray(cache["num_paths"], dtype=np.float64).copy()
+    path_costs = np.asarray(cache["path_costs"], dtype=np.float64)[od_indices].copy()
+    num_paths = np.asarray(cache["num_paths"], dtype=np.float64)[od_indices].copy()
     sensitivity_scores = (tm * path_costs).astype(np.float32, copy=False)
-    bottleneck_util = np.zeros(num_od, dtype=np.float64)
-    mean_path_util = np.zeros(num_od, dtype=np.float64)
-    bottleneck_delta_abs = np.zeros(num_od, dtype=np.float64)
-    hop_count = np.asarray(cache["hop_count"], dtype=np.float64).copy()
+    bottleneck_util = np.zeros(num_eval_od, dtype=np.float64)
+    mean_path_util = np.zeros(num_eval_od, dtype=np.float64)
+    bottleneck_delta_abs = np.zeros(num_eval_od, dtype=np.float64)
+    hop_count = np.asarray(cache["hop_count"], dtype=np.float64)[od_indices].copy()
     best_path_edges_list = cache["best_path_edges_list"]
 
     util = np.zeros(num_edges, dtype=np.float64)
@@ -568,13 +590,13 @@ def build_od_features_plus(
         fail_mask[: min(num_edges, src.size)] = src[: min(num_edges, src.size)]
 
     has_active_failure = _has_active_failure_mask(fail_mask)
-    alt_path_headroom = np.zeros(num_od, dtype=np.float64)
-    surviving_best_headroom = np.zeros(num_od, dtype=np.float64)
+    alt_path_headroom = np.zeros(num_eval_od, dtype=np.float64)
+    surviving_best_headroom = np.zeros(num_eval_od, dtype=np.float64)
     surviving_path_count = num_paths.copy()
-    path_set_shrink_ratio = np.zeros(num_od, dtype=np.float64)
-    prev_best_invalid_flag = np.zeros(num_od, dtype=np.float64)
+    path_set_shrink_ratio = np.zeros(num_eval_od, dtype=np.float64)
+    prev_best_invalid_flag = np.zeros(num_eval_od, dtype=np.float64)
 
-    for od_idx in range(num_od):
+    for local_idx, od_idx in enumerate(od_indices.tolist()):
         all_paths = path_library.edge_idx_paths_by_od[od_idx]
         best_path_edges = best_path_edges_list[od_idx]
         selected_path_edges = list(best_path_edges)
@@ -582,7 +604,7 @@ def build_od_features_plus(
         if has_active_failure:
             surviving_paths: list[list[int]] = []
             if best_path_edges:
-                prev_best_invalid_flag[od_idx] = float(_path_hits_failure_mask(best_path_edges, fail_mask))
+                prev_best_invalid_flag[local_idx] = float(_path_hits_failure_mask(best_path_edges, fail_mask))
             for edge_path in all_paths:
                 if not edge_path:
                     continue
@@ -591,8 +613,8 @@ def build_od_features_plus(
                 surviving_paths.append(list(edge_path))
 
             total_paths = max(len(all_paths), 1)
-            surviving_path_count[od_idx] = float(len(surviving_paths))
-            path_set_shrink_ratio[od_idx] = 1.0 - float(len(surviving_paths)) / float(total_paths)
+            surviving_path_count[local_idx] = float(len(surviving_paths))
+            path_set_shrink_ratio[local_idx] = 1.0 - float(len(surviving_paths)) / float(total_paths)
             if surviving_paths:
                 selected_path_edges = min(
                     surviving_paths,
@@ -609,20 +631,20 @@ def build_od_features_plus(
         if path_edges:
             path_idx = np.asarray(path_edges, dtype=np.int64)
             path_utils = util[path_idx]
-            bottleneck_util[od_idx] = float(np.max(path_utils)) if path_utils.size else 0.0
-            mean_path_util[od_idx] = float(np.mean(path_utils)) if path_utils.size else 0.0
-            hop_count[od_idx] = float(path_idx.size)
-            surviving_best_headroom[od_idx] = float(max(0.0, 1.0 - np.max(path_utils))) if path_utils.size else 0.0
+            bottleneck_util[local_idx] = float(np.max(path_utils)) if path_utils.size else 0.0
+            mean_path_util[local_idx] = float(np.mean(path_utils)) if path_utils.size else 0.0
+            hop_count[local_idx] = float(path_idx.size)
+            surviving_best_headroom[local_idx] = float(max(0.0, 1.0 - np.max(path_utils))) if path_utils.size else 0.0
             if prev_util_arr is not None and path_utils.size:
                 prev_path_utils = prev_util_arr[path_idx]
-                bottleneck_delta_abs[od_idx] = abs(float(np.max(path_utils)) - float(np.max(prev_path_utils)))
+                bottleneck_delta_abs[local_idx] = abs(float(np.max(path_utils)) - float(np.max(prev_path_utils)))
 
         for alt_edges in alt_candidates[:3]:
             if not alt_edges or list(alt_edges) == list(path_edges):
                 continue
             path_utils = util[np.asarray(alt_edges, dtype=np.int64)]
             if path_utils.size:
-                alt_path_headroom[od_idx] = max(alt_path_headroom[od_idx], 1.0 - float(np.max(path_utils)))
+                alt_path_headroom[local_idx] = max(alt_path_headroom[local_idx], 1.0 - float(np.max(path_utils)))
 
     # Normalize original features
     path_costs_norm = path_costs / (np.max(path_costs) + 1e-12)
@@ -631,10 +653,10 @@ def build_od_features_plus(
     active = (tm > 0).astype(np.float64)
     headroom = np.clip(1.0 - bottleneck_util, 0.0, 1.0)
 
-    demand_rank = np.zeros(num_od, dtype=np.float64)
+    demand_rank = np.zeros(num_eval_od, dtype=np.float64)
     sorted_idx = np.argsort(tm)
-    if num_od > 1:
-        demand_rank[sorted_idx] = np.linspace(0.0, 1.0, num_od, dtype=np.float64)
+    if num_eval_od > 1:
+        demand_rank[sorted_idx] = np.linspace(0.0, 1.0, num_eval_od, dtype=np.float64)
 
     # --- NEW features ---
 
@@ -644,10 +666,10 @@ def build_od_features_plus(
     hop_count_norm = hop_count / (np.max(hop_count) + 1e-12)
 
     # 11: demand_change_ratio
-    demand_change = np.ones(num_od, dtype=np.float64) * 0.5
-    demand_delta_abs = np.zeros(num_od, dtype=np.float64)
+    demand_change = np.ones(num_eval_od, dtype=np.float64) * 0.5
+    demand_delta_abs = np.zeros(num_eval_od, dtype=np.float64)
     if prev_tm is not None:
-        prev = np.asarray(prev_tm, dtype=np.float64)
+        prev = np.asarray(prev_tm, dtype=np.float64)[od_indices]
         ratio = tm / (prev + 1e-12)
         ratio_clipped = np.clip(ratio, 0.5, 2.0)
         demand_change = (ratio_clipped - 0.5) / 1.5
@@ -659,15 +681,16 @@ def build_od_features_plus(
     # 13: dst_congestion
     dst_congestion = max_util_in[od_dst]
 
-    path_overlap = np.zeros(num_od, dtype=np.float64)
+    path_overlap = np.zeros(num_eval_od, dtype=np.float64)
     if variant == "legacy":
         edge_od_count = (
-            (tm > 1e-12).astype(np.float32) @ np.asarray(cache["best_path_incidence"], dtype=np.float32)
+            (tm_full > 1e-12).astype(np.float32) @ np.asarray(cache["best_path_incidence"], dtype=np.float32)
         ).astype(np.float64)
         shared_edge_mask = (edge_od_count > 1.0).astype(np.float32)
         overlap_mass = np.asarray(cache["best_path_incidence"], dtype=np.float32) @ shared_edge_mask
         valid_hops = hop_count > 0
-        path_overlap[valid_hops] = overlap_mass[valid_hops] / hop_count[valid_hops]
+        overlap_subset = overlap_mass[od_indices]
+        path_overlap[valid_hops] = overlap_subset[valid_hops] / hop_count[valid_hops]
 
     # 15: bottleneck perception / congestion pressure
     bn_scores = tm * bottleneck_util
@@ -683,7 +706,8 @@ def build_od_features_plus(
     demand_x_hop_norm = demand_x_hop / (np.max(demand_x_hop) + 1e-12)
     bottleneck_delta_abs_norm = bottleneck_delta_abs / (np.max(bottleneck_delta_abs) + 1e-12)
     demand_delta_abs_norm = demand_delta_abs / (np.max(demand_delta_abs) + 1e-12)
-    prev_selected = _normalize_prev_selected_indicator(prev_selected_indicator, num_od)
+    prev_selected_full = _normalize_prev_selected_indicator(prev_selected_indicator, num_od)
+    prev_selected = prev_selected_full[od_indices]
     if has_active_failure:
         prev_selected = np.zeros_like(prev_selected)
     prev_dist_scalar = float(np.clip(prev_disturbance, 0.0, 1.0))
@@ -756,23 +780,26 @@ def build_od_features_plus(
     ], axis=1).astype(np.float32)
 
     bottleneck_scores = tm.astype(np.float32) * bottleneck_util.astype(np.float32)
+    attention_bias = np.zeros((num_eval_od, num_eval_od), dtype=np.float32)
+    if num_eval_od > 1:
+        # Use exact integer overlap counts here. The previous float32 GEMM on a
+        # 0/1 incidence matrix occasionally emitted spurious "invalid value
+        # encountered in matmul" warnings on the local NumPy/OpenBLAS stack
+        # even though both inputs and outputs were finite.
+        incidence_subset = np.asarray(cache["best_path_incidence_u8"], dtype=np.uint8)[od_indices]
+        shared = (incidence_subset @ incidence_subset.T) > 0.0
+        attention_bias = shared.astype(np.float32, copy=False)
+        np.fill_diagonal(attention_bias, 0.0)
 
     return {
         "od_features": _float_tensor_from_numpy(od_feat, dev),
-        "od_src_idx": _cached_long_tensor(
-            cache,
-            tensor_key="od_src_tensor_cpu",
-            array_key="od_src",
-            device=dev,
-        ),
-        "od_dst_idx": _cached_long_tensor(
-            cache,
-            tensor_key="od_dst_tensor_cpu",
-            array_key="od_dst",
-            device=dev,
-        ),
+        "od_src_idx": _long_tensor_from_numpy(od_src, dev),
+        "od_dst_idx": _long_tensor_from_numpy(od_dst, dev),
         "sensitivity_scores": _float_tensor_from_numpy(sensitivity_scores, dev),
         "bottleneck_scores": _float_tensor_from_numpy(bottleneck_scores, dev),
+        "attention_bias": _float_tensor_from_numpy(attention_bias, dev),
+        "candidate_od_indices": _long_tensor_from_numpy(od_indices, dev),
+        "full_num_od": int(num_od),
     }
 
 
@@ -813,6 +840,7 @@ class GNNPlusFlowSelector(GNNFlowSelector):
         """
         with torch.no_grad():
             scores, k_pred, info = self.forward(graph_data, od_data)
+        info = {k: v for k, v in info.items() if not str(k).startswith("_")}
 
         if force_default_k or k_pred is None:
             k = k_crit_default
@@ -820,7 +848,29 @@ class GNNPlusFlowSelector(GNNFlowSelector):
             k = max(self._k_min, min(k_pred, self._k_max))
 
         scores_np = scores.detach().cpu().numpy().astype(np.float32)
-        active = np.asarray(active_mask, dtype=bool)
+        candidate_od_indices = od_data.get("candidate_od_indices")
+        candidate_np = None
+        if candidate_od_indices is not None:
+            if isinstance(candidate_od_indices, torch.Tensor):
+                candidate_np = candidate_od_indices.detach().cpu().numpy().astype(np.int64, copy=False)
+            else:
+                candidate_np = np.asarray(candidate_od_indices, dtype=np.int64).reshape(-1)
+
+        active_full = np.asarray(active_mask, dtype=bool).reshape(-1)
+        if candidate_np is not None and candidate_np.size == scores_np.shape[0]:
+            if active_full.size == scores_np.shape[0]:
+                active = active_full
+            else:
+                active = np.zeros(scores_np.shape[0], dtype=bool)
+                valid = (candidate_np >= 0) & (candidate_np < active_full.size)
+                active[valid] = active_full[candidate_np[valid]]
+        else:
+            if active_full.size != scores_np.shape[0]:
+                active = np.zeros(scores_np.shape[0], dtype=bool)
+                take = min(scores_np.shape[0], active_full.size)
+                active[:take] = active_full[:take]
+            else:
+                active = active_full
         active_indices = np.where(active)[0]
 
         if active_indices.size == 0 or k <= 0:
@@ -828,12 +878,17 @@ class GNNPlusFlowSelector(GNNFlowSelector):
             info["k_default"] = k_crit_default
             info["k_dynamic"] = k_pred
             info["continuity_bonus"] = float(continuity_bonus)
+            info["candidate_pool_size"] = int(scores_np.shape[0]) if candidate_np is not None else int(active_full.size)
+            info["prefilter_used"] = bool(candidate_np is not None)
             return [], info
 
         take = min(k, active_indices.size)
         active_scores = scores_np[active_indices]
         ranking_scores = active_scores
         prev_selected = _normalize_prev_selected_indicator(prev_selected_indicator, scores_np.shape[0])
+        if candidate_np is not None and prev_selected_indicator is not None and prev_selected.size != scores_np.shape[0]:
+            prev_full = _normalize_prev_selected_indicator(prev_selected_indicator, int(od_data.get("full_num_od", scores_np.shape[0])))
+            prev_selected = prev_full[candidate_np]
         if float(continuity_bonus) > 0.0 and prev_selected.size == scores_np.shape[0]:
             score_span = float(np.max(active_scores) - np.min(active_scores))
             if score_span > 1e-12:
@@ -842,15 +897,25 @@ class GNNPlusFlowSelector(GNNFlowSelector):
                 normalized_scores = np.zeros_like(active_scores)
             ranking_scores = normalized_scores + float(continuity_bonus) * prev_selected[active_indices]
         top_local = np.argsort(-ranking_scores, kind="mergesort")[:take]
-        selected = [int(active_indices[i]) for i in top_local]
+        if candidate_np is not None and candidate_np.size == scores_np.shape[0]:
+            selected = [int(candidate_np[int(active_indices[i])]) for i in top_local]
+        else:
+            selected = [int(active_indices[i]) for i in top_local]
 
         info["k_used"] = take
         info["k_default"] = k_crit_default
         info["k_dynamic"] = k_pred
         info["continuity_bonus"] = float(continuity_bonus)
-        info["continuity_kept"] = int(
-            sum(1 for od in selected if od < prev_selected.size and prev_selected[od] > 0.5)
-        )
+        info["candidate_pool_size"] = int(scores_np.shape[0]) if candidate_np is not None else int(active_full.size)
+        info["prefilter_used"] = bool(candidate_np is not None)
+        if prev_selected_indicator is not None and selected:
+            full_num_od = int(od_data.get("full_num_od", scores_np.shape[0]))
+            prev_selected_full = _normalize_prev_selected_indicator(prev_selected_indicator, full_num_od)
+            info["continuity_kept"] = int(
+                sum(1 for od in selected if 0 <= int(od) < prev_selected_full.size and prev_selected_full[int(od)] > 0.5)
+            )
+        else:
+            info["continuity_kept"] = 0
         return selected, info
 
 
@@ -871,6 +936,10 @@ def save_gnn_plus(model: GNNPlusFlowSelector, path, extra_meta=None):
             "k_crit_min": cfg.k_crit_min,
             "k_crit_max": cfg.k_crit_max,
             "feature_variant": cfg.feature_variant,
+            "use_gated_residual": cfg.use_gated_residual,
+            "use_cross_od_attention": cfg.use_cross_od_attention,
+            "cross_od_attention_heads": cfg.cross_od_attention_heads,
+            "bottleneck_moe_floor": cfg.bottleneck_moe_floor,
         },
         "model_type": "gnn_plus",
     }
@@ -885,7 +954,7 @@ def load_gnn_plus(path, device="cpu"):
     cfg = GNNPlusConfig(**payload["config"])
     cfg.device = device
     model = GNNPlusFlowSelector(cfg)
-    model.load_state_dict(payload["state_dict"])
+    model.load_state_dict(payload["state_dict"], strict=False)
     model.eval()
     return model, cfg
 

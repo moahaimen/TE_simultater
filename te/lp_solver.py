@@ -74,6 +74,7 @@ def solve_selected_path_lp(
     base_splits: Sequence[np.ndarray],
     path_library: PathLibrary,
     capacities: np.ndarray,
+    warm_start_splits: Sequence[np.ndarray] | None = None,
     time_limit_sec: int = 20,
     solver_msg: bool = False,
 ) -> HybridLPResult:
@@ -111,6 +112,12 @@ def solve_selected_path_lp(
         for path_idx, edge_path in enumerate(paths):
             # f_od,path is the traffic amount assigned to one candidate path.
             var = pulp.LpVariable(f"f_{od_idx}_{path_idx}", lowBound=0.0)
+            if warm_start_splits is not None and 0 <= int(od_idx) < len(warm_start_splits):
+                warm_vec = np.asarray(warm_start_splits[int(od_idx)], dtype=float).reshape(-1)
+                if warm_vec.size == len(paths):
+                    warm_sum = float(np.sum(warm_vec))
+                    if warm_sum > EPS:
+                        var.setInitialValue(float(demand) * float(max(warm_vec[path_idx], 0.0) / warm_sum))
             flow_vars[(od_idx, path_idx)] = var
             per_od_vars.append(var)
             for edge_idx in edge_path:
@@ -130,7 +137,12 @@ def solve_selected_path_lp(
     # Minimize U, i.e., minimize the worst link utilization (MLU).
     model += U
 
-    solver = pulp.PULP_CBC_CMD(msg=solver_msg, timeLimit=int(time_limit_sec), threads=1)
+    solver = pulp.PULP_CBC_CMD(
+        msg=solver_msg,
+        timeLimit=int(time_limit_sec),
+        threads=1,
+        warmStart=bool(warm_start_splits is not None),
+    )
     status_code = model.solve(solver)
     status = pulp.LpStatus.get(status_code, "Unknown")
 

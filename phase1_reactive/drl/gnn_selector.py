@@ -47,6 +47,10 @@ class GNNSelectorConfig:
     learn_k_crit: bool = True          # whether to predict k_crit dynamically
     k_crit_min: int = 10
     k_crit_max: int = 200
+    use_gated_residual: bool = False       # Change 2: gated residual with learned deferral
+    use_cross_od_attention: bool = False   # Change 3: cross-OD attention layer
+    cross_od_attention_heads: int = 2      # number of attention heads for cross-OD
+    bottleneck_moe_floor: float = 0.10     # Track C1: preserve exact bottleneck fallback mass
     device: str = "cpu"
 
 
@@ -403,6 +407,45 @@ class GNNFlowSelector(nn.Module):
         self._k_min = cfg.k_crit_min
         self._k_max = cfg.k_crit_max
 
+        # --- Change 2: Gated Residual with Learned Deferral ---
+        if getattr(cfg, "use_gated_residual", False):
+            self.gate_head = nn.Sequential(
+                nn.Linear(h + 1, h // 4),  # +1 for disruption_signal
+                nn.ReLU(),
+                nn.Linear(h // 4, 1),
+            )
+            # Full OD scorer for gated path (produces gnn_full_score)
+            self.od_scorer_gated = nn.Sequential(
+                nn.Linear(h * 2 + cfg.od_dim, h),
+                nn.ReLU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(h, h // 2),
+                nn.ReLU(),
+                nn.Linear(h // 2, 1),
+            )
+            self.bottleneck_aux_head = nn.Sequential(
+                nn.Linear(h * 2 + cfg.od_dim, h // 2),
+                nn.ReLU(),
+                nn.Linear(h // 2, 1),
+            )
+
+        # --- Change 3: Cross-OD Attention Layer ---
+        if getattr(cfg, "use_cross_od_attention", False):
+            self.od_input_proj = nn.Linear(h * 2 + cfg.od_dim, h)
+            self.cross_od_attention = nn.MultiheadAttention(
+                embed_dim=h,
+                num_heads=cfg.cross_od_attention_heads,
+                dropout=cfg.dropout,
+                batch_first=True,
+            )
+            self.cross_od_edge_bias = nn.Parameter(torch.tensor(0.10))
+            self.cross_od_norm = nn.LayerNorm(h)
+            self.od_scorer_attended = nn.Sequential(
+                nn.Linear(h, h // 2),
+                nn.ReLU(),
+                nn.Linear(h // 2, 1),
+            )
+
     @property
     def alpha(self):
         """Residual blending weight (clamped positive)."""
@@ -441,11 +484,36 @@ class GNNFlowSelector(nn.Module):
         # Global graph embedding for topology-conditioned decisions
         graph_embed = h.mean(dim=0)  # [hidden]
 
-        # OD-pair scoring (GNN correction)
+        # OD-pair scoring inputs
         src_embed = h[od_src]                        # [num_od, hidden]
         dst_embed = h[od_dst]                        # [num_od, hidden]
         od_input = torch.cat([src_embed, dst_embed, od_feat], dim=-1)
-        gnn_correction = self.od_scorer(od_input).squeeze(-1)  # [num_od]
+        attended_used = False
+        bottleneck_aux_pred = None
+
+        # Change 3: optional cross-OD interaction on the candidate pool.
+        if getattr(self.cfg, "use_cross_od_attention", False):
+            od_embed = self.od_input_proj(od_input)
+            attn_bias = od_data.get("attention_bias")
+            attn_mask = None
+            if attn_bias is not None:
+                if not isinstance(attn_bias, torch.Tensor):
+                    attn_bias = torch.tensor(attn_bias, dtype=od_embed.dtype, device=od_embed.device)
+                else:
+                    attn_bias = attn_bias.to(device=od_embed.device, dtype=od_embed.dtype)
+                attn_mask = self.cross_od_edge_bias * attn_bias
+            attn_out, _ = self.cross_od_attention(
+                od_embed.unsqueeze(0),
+                od_embed.unsqueeze(0),
+                od_embed.unsqueeze(0),
+                attn_mask=attn_mask,
+                need_weights=False,
+            )
+            od_embed = self.cross_od_norm(od_embed + attn_out.squeeze(0))
+            gnn_correction = self.od_scorer_attended(od_embed).squeeze(-1)
+            attended_used = True
+        else:
+            gnn_correction = self.od_scorer(od_input).squeeze(-1)
 
         # Normalize heuristic scores and GNN correction
         bn_norm = bottleneck / (bottleneck.abs().max() + 1e-12)
@@ -460,12 +528,44 @@ class GNNFlowSelector(nn.Module):
         # Adaptive base: topology-conditioned blend of internal heuristics only
         base_scores = w_bn * bn_norm + w_sens * sens_norm
 
-        # Confidence: how much to trust GNN correction for this topology
-        confidence = self.confidence_head(graph_embed).squeeze()  # scalar in [0, 1]
-        alpha = self.alpha
+        gate = None
+        disruption_signal = 0.0
 
-        # Final: adaptive base + confidence-scaled GNN correction
-        final_scores = base_scores + confidence * alpha * corr_norm
+        # Change 2: learned deferral to bottleneck under disruption / uncertainty.
+        if getattr(self.cfg, "use_gated_residual", False):
+            gnn_full_score = gnn_correction
+            if not attended_used:
+                gnn_full_score = self.od_scorer_gated(od_input).squeeze(-1)
+            gnn_full_norm = gnn_full_score / (gnn_full_score.abs().max() + 1e-12)
+            bottleneck_aux_pred = self.bottleneck_aux_head(od_input).squeeze(-1)
+            disruption_raw = graph_data.get("disruption_signal", 0.0)
+            if isinstance(disruption_raw, torch.Tensor):
+                disruption_tensor = disruption_raw.to(device=graph_embed.device, dtype=graph_embed.dtype).reshape(1)
+            else:
+                disruption_tensor = torch.tensor(
+                    [float(disruption_raw)],
+                    device=graph_embed.device,
+                    dtype=graph_embed.dtype,
+                )
+            disruption_signal = float(disruption_tensor.item())
+            gate_input = torch.cat([graph_embed, disruption_tensor], dim=0)
+            gate_logit = self.gate_head(gate_input).squeeze()
+            gate_temperature = float(graph_data.get("gate_temperature", 1.0))
+            gate_temperature = max(gate_temperature, 1e-6)
+            gate_prob = torch.sigmoid(gate_logit / gate_temperature)
+            gnn_weight = gate_prob * (1.0 - float(self.cfg.bottleneck_moe_floor))
+            bottleneck_weight = 1.0 - gnn_weight
+            gate = gnn_weight
+            confidence = gnn_weight
+            alpha = torch.tensor(1.0, device=graph_embed.device, dtype=graph_embed.dtype)
+            final_scores = bottleneck_weight * bn_norm + gnn_weight * gnn_full_norm
+        else:
+            # Confidence: how much to trust GNN correction for this topology
+            confidence = self.confidence_head(graph_embed).squeeze()  # scalar in [0, 1]
+            alpha = self.alpha
+
+            # Final: adaptive base + confidence-scaled GNN correction
+            final_scores = base_scores + confidence * alpha * corr_norm
 
         # Dynamic k_crit prediction
         k_pred = None
@@ -481,8 +581,23 @@ class GNNFlowSelector(nn.Module):
             "w_sensitivity": float(w_sens.item()),
             "gnn_correction_mean": float(gnn_correction.mean().item()),
             "gnn_correction_std": float(gnn_correction.std().item()),
+            "use_gated_residual": bool(getattr(self.cfg, "use_gated_residual", False)),
+            "use_cross_od_attention": bool(getattr(self.cfg, "use_cross_od_attention", False)),
+            "attended_used": bool(attended_used),
+            "gate": None if gate is None else float(gate.item()),
+            "gate_temperature": float(graph_data.get("gate_temperature", 1.0)),
+            "bottleneck_weight": (
+                None
+                if gate is None
+                else float((1.0 - gate).item())
+            ),
+            "gnn_weight": None if gate is None else float(gate.item()),
+            "disruption_signal": float(disruption_signal),
             "k_pred": k_pred,
         }
+        if getattr(self.cfg, "use_gated_residual", False):
+            info["_gate_logit"] = gate_logit
+            info["_bottleneck_aux_pred"] = bottleneck_aux_pred
 
         return final_scores, k_pred, info
 
@@ -496,10 +611,33 @@ class GNNFlowSelector(nn.Module):
         """
         with torch.no_grad():
             scores, k_pred, info = self.forward(graph_data, od_data)
+        info = {k: v for k, v in info.items() if not str(k).startswith("_")}
 
         k = k_crit_default if force_default_k else (k_pred if k_pred is not None else k_crit_default)
         scores_np = scores.detach().cpu().numpy().astype(np.float32)
-        active = np.asarray(active_mask, dtype=bool)
+        candidate_od_indices = od_data.get("candidate_od_indices")
+        candidate_np = None
+        if candidate_od_indices is not None:
+            if isinstance(candidate_od_indices, torch.Tensor):
+                candidate_np = candidate_od_indices.detach().cpu().numpy().astype(np.int64, copy=False)
+            else:
+                candidate_np = np.asarray(candidate_od_indices, dtype=np.int64).reshape(-1)
+
+        active_full = np.asarray(active_mask, dtype=bool).reshape(-1)
+        if candidate_np is not None and candidate_np.size == scores_np.shape[0]:
+            if active_full.size == scores_np.shape[0]:
+                active = active_full
+            else:
+                active = np.zeros(scores_np.shape[0], dtype=bool)
+                valid = (candidate_np >= 0) & (candidate_np < active_full.size)
+                active[valid] = active_full[candidate_np[valid]]
+        else:
+            if active_full.size != scores_np.shape[0]:
+                active = np.zeros(scores_np.shape[0], dtype=bool)
+                take = min(scores_np.shape[0], active_full.size)
+                active[:take] = active_full[:take]
+            else:
+                active = active_full
         active_indices = np.where(active)[0]
 
         if active_indices.size == 0 or k <= 0:
@@ -508,9 +646,14 @@ class GNNFlowSelector(nn.Module):
         take = min(k, active_indices.size)
         active_scores = scores_np[active_indices]
         top_local = np.argsort(-active_scores, kind="mergesort")[:take]
-        selected = [int(active_indices[i]) for i in top_local]
+        if candidate_np is not None and candidate_np.size == scores_np.shape[0]:
+            selected = [int(candidate_np[int(active_indices[i])]) for i in top_local]
+        else:
+            selected = [int(active_indices[i]) for i in top_local]
         info["k_used"] = take
         info["k_default"] = k_crit_default
+        info["candidate_pool_size"] = int(scores_np.shape[0]) if candidate_np is not None else int(active_full.size)
+        info["prefilter_used"] = bool(candidate_np is not None)
         return selected, info
 
 
@@ -657,6 +800,10 @@ def save_gnn_selector(model: GNNFlowSelector, cfg: GNNSelectorConfig, path, extr
             "learn_k_crit": cfg.learn_k_crit,
             "k_crit_min": cfg.k_crit_min,
             "k_crit_max": cfg.k_crit_max,
+            "use_gated_residual": cfg.use_gated_residual,
+            "use_cross_od_attention": cfg.use_cross_od_attention,
+            "cross_od_attention_heads": cfg.cross_od_attention_heads,
+            "bottleneck_moe_floor": cfg.bottleneck_moe_floor,
         },
     }
     if extra:
@@ -669,6 +816,6 @@ def load_gnn_selector(path, device="cpu") -> tuple[GNNFlowSelector, GNNSelectorC
     cfg = GNNSelectorConfig(**payload["config"])
     cfg.device = device
     model = GNNFlowSelector(cfg)
-    model.load_state_dict(payload["state_dict"])
+    model.load_state_dict(payload["state_dict"], strict=False)
     model.eval()
     return model, cfg

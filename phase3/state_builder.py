@@ -92,6 +92,7 @@ def compute_telemetry(
     weights: np.ndarray,
     prev_latency_by_od: np.ndarray | None = None,
     cfg: TelemetryConfig | None = None,
+    fast_links_only: bool = False,
 ) -> TelemetrySnapshot:
     cfg = cfg or TelemetryConfig()
     util = np.asarray(routing.utilization, dtype=float)
@@ -99,6 +100,27 @@ def compute_telemetry(
     link_delay = derive_link_delay(util, np.asarray(weights, dtype=float), delay_sensitivity=cfg.delay_sensitivity)
 
     total_demand = float(np.sum(np.maximum(tm_vector, 0.0)))
+    if fast_links_only:
+        zeros = np.zeros(len(path_library.od_pairs), dtype=float)
+        routed_demand = float(total_demand)
+        return TelemetrySnapshot(
+            utilization=util,
+            queue_length=queue,
+            link_delay=link_delay,
+            mean_latency=0.0,
+            p95_latency=0.0,
+            jitter=0.0,
+            throughput=1.0 if total_demand > 0 else 1.0,
+            packet_loss=0.0,
+            dropped_demand_pct=0.0,
+            routed_demand=routed_demand,
+            total_demand=float(total_demand),
+            latency_by_od=zeros,
+            latency_weight_by_od=zeros,
+            mean_utilization=float(routing.mean_utilization),
+            mlu=float(routing.mlu),
+        )
+
     latency_by_od = np.zeros(len(path_library.od_pairs), dtype=float)
     latency_weight_by_od = np.zeros(len(path_library.od_pairs), dtype=float)
 

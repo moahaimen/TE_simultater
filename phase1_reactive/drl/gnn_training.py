@@ -66,6 +66,9 @@ class GNNReinforceConfig:
     max_epochs: int = 10
     patience: int = 4
     baseline_ema: float = 0.9
+    entropy_weight: float = 0.0
+    w_reward_mlu_normal: float = 1.15
+    w_reward_mlu_failure: float = 1.15
     w_reward_mlu: float = 1.15
     w_reward_improvement: float = 0.85
     w_reward_disturbance: float = 0.15
@@ -76,6 +79,11 @@ class GNNReinforceConfig:
     rank_loss_weight: float = 0.25
     score_margin_weight: float = 0.08
     infeasible_mlu_penalty: float = 10.0
+    rl_synthetic_failure_prob: float = 0.08
+    kl_beta_failure: float = 0.002
+    failure_kl_target: float = 0.05
+    normal_kl_abort: float = 0.30
+    normal_kl_abort_patience: int = 2
 
 
 def _rank_scores(indices, num_od: int, weight: float) -> np.ndarray:

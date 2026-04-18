@@ -264,7 +264,17 @@ def gnn_select_critical(model, dataset, path_library, tm_vector, k_crit=K_CRIT):
         return selected
 
 
-def solve_selected_path_lp_safe(*, tm_vector, selected_ods, base_splits, path_library, capacities, time_limit_sec, context):
+def solve_selected_path_lp_safe(
+    *,
+    tm_vector,
+    selected_ods,
+    base_splits,
+    path_library,
+    capacities,
+    time_limit_sec,
+    context,
+    warm_start_splits=None,
+):
     assert_selected_ods_have_paths(path_library, selected_ods, context=context)
     return solve_selected_path_lp(
         tm_vector=tm_vector,
@@ -272,6 +282,7 @@ def solve_selected_path_lp_safe(*, tm_vector, selected_ods, base_splits, path_li
         base_splits=base_splits,
         path_library=path_library,
         capacities=capacities,
+        warm_start_splits=warm_start_splits,
         time_limit_sec=time_limit_sec,
     )
 

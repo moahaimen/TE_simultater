@@ -2,13 +2,50 @@
 
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
 from te.paths import PathLibrary
 
 EPS = 1e-12
+_BOTTLENECK_CACHE: Dict[Tuple[int, int, int, int], Dict[str, np.ndarray]] = {}
+
+
+def _get_bottleneck_cache(
+    ecmp_policy: Sequence[np.ndarray],
+    path_library: PathLibrary,
+    num_edges: int,
+) -> Dict[str, np.ndarray]:
+    cache_key = (id(path_library), id(ecmp_policy), len(path_library.od_pairs), int(num_edges))
+    cached = _BOTTLENECK_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    num_od = len(path_library.od_pairs)
+    unit_edge_contrib = np.zeros((num_od, int(num_edges)), dtype=np.float32)
+    for od_idx in range(num_od):
+        splits = np.asarray(ecmp_policy[od_idx], dtype=float)
+        edge_paths = path_library.edge_idx_paths_by_od[od_idx]
+        if splits.size == 0 or not edge_paths:
+            continue
+        split_sum = float(np.sum(splits))
+        if split_sum <= EPS:
+            continue
+        normalized = splits / split_sum
+        max_paths = min(len(edge_paths), normalized.size)
+        for path_idx in range(max_paths):
+            frac = float(normalized[path_idx])
+            if frac <= 0.0:
+                continue
+            edge_path = edge_paths[path_idx]
+            if not edge_path:
+                continue
+            np.add.at(unit_edge_contrib[od_idx], np.asarray(edge_path, dtype=np.int64), frac)
+
+    cached = {"unit_edge_contrib": unit_edge_contrib}
+    _BOTTLENECK_CACHE[cache_key] = cached
+    return cached
 
 
 def clone_splits(splits: Sequence[np.ndarray]) -> List[np.ndarray]:
@@ -76,32 +113,13 @@ def select_bottleneck_critical(
     if k_crit <= 0:
         return []
 
-    num_edges = capacities.size
-    link_loads = np.zeros(num_edges, dtype=float)
-    od_edge_contrib = [dict() for _ in range(len(tm_vector))]
+    tm_arr = np.asarray(tm_vector, dtype=float)
+    active_idx = np.flatnonzero(tm_arr > 0.0)
+    if active_idx.size == 0:
+        return []
 
-    for od_idx, demand in enumerate(tm_vector):
-        if demand <= 0:
-            continue
-
-        splits = np.asarray(ecmp_policy[od_idx], dtype=float)
-        paths = path_library.edge_idx_paths_by_od[od_idx]
-        if not paths or splits.size == 0:
-            continue
-
-        split_sum = float(np.sum(splits))
-        if split_sum <= EPS:
-            continue
-
-        splits = splits / split_sum
-        for path_idx, frac in enumerate(splits):
-            if frac <= 0:
-                continue
-            flow = float(demand) * float(frac)
-            for edge_idx in paths[path_idx]:
-                link_loads[edge_idx] += flow
-                od_edge_contrib[od_idx][edge_idx] = od_edge_contrib[od_idx].get(edge_idx, 0.0) + flow
-
+    unit_edge_contrib = _get_bottleneck_cache(ecmp_policy, path_library, capacities.size)["unit_edge_contrib"]
+    link_loads = tm_arr @ unit_edge_contrib
     util = link_loads / np.maximum(capacities, EPS)
     mlu = float(np.max(util)) if util.size else 0.0
     if mlu <= EPS:
@@ -110,17 +128,9 @@ def select_bottleneck_critical(
     # ODs are ranked by how strongly they load links near the current MLU.
     # This is still bounded by Kcrit, so we preserve a fixed-size action budget.
     weights = util / mlu
-    scored = []
-    for od_idx, demand in enumerate(tm_vector):
-        if demand <= 0:
-            continue
-        score = 0.0
-        for edge_idx, flow in od_edge_contrib[od_idx].items():
-            score += flow * float(weights[edge_idx])
-        scored.append((score, od_idx))
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return [od_idx for _, od_idx in scored[:k_crit]]
+    scores = tm_arr * (unit_edge_contrib @ weights)
+    ranked = active_idx[np.argsort(-scores[active_idx], kind="mergesort")]
+    return ranked[:k_crit].astype(int).tolist()
 
 
 def select_sensitivity_critical(
