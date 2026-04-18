@@ -159,7 +159,8 @@ DISTURBANCE_CHURN_MULTIPLIER = float(os.environ.get("GNNPLUS_DIST_CHURN_MULTIPLI
 DO_NO_HARM_THRESHOLD = float(os.environ.get("GNNPLUS_DO_NO_HARM_THRESHOLD", "1.02"))
 DO_NO_HARM_THRESHOLD_KNOWN = float(os.environ.get("GNNPLUS_DO_NO_HARM_THRESHOLD_KNOWN", str(DO_NO_HARM_THRESHOLD)))
 DO_NO_HARM_THRESHOLD_UNSEEN = float(os.environ.get("GNNPLUS_DO_NO_HARM_THRESHOLD_UNSEEN", "1.00"))
-DO_NO_HARM_CACHE_STEPS = int(os.environ.get("GNNPLUS_DO_NO_HARM_CACHE_STEPS", "10"))
+DO_NO_HARM_CACHE_STEPS = int(os.environ.get("GNNPLUS_DO_NO_HARM_CACHE_STEPS", "20"))
+DO_NO_HARM_FALLBACK_COOLDOWN = int(os.environ.get("GNNPLUS_DO_NO_HARM_FALLBACK_COOLDOWN", "4"))
 DO_NO_HARM_OVERLAP_SKIP = float(os.environ.get("GNNPLUS_DO_NO_HARM_OVERLAP_SKIP", "0.90"))
 CALIBRATION_MAX_SAMPLES_PER_TOPO = int(os.environ.get("GNNPLUS_CALIBRATION_MAX_SAMPLES_PER_TOPO", "200"))
 SUP_LP_GAP_MEAN_GATE = float(os.environ.get("GNNPLUS_SUP_LP_GAP_MEAN_GATE", "0.03"))
@@ -178,8 +179,20 @@ EXTREME_STRESS_FAIL_COUNT = int(os.environ.get("GNNPLUS_EXTREME_STRESS_FAIL_COUN
 # computed only from known topologies; never touches germany50 or vtlwavenet2011).
 PER_TOPO_REWARD_NORM = os.environ.get("GNNPLUS_PER_TOPO_REWARD_NORM", "0") == "1"
 
+def _parse_extra_topologies(raw: str) -> list[str]:
+    items: list[str] = []
+    for chunk in str(raw or "").split(","):
+        topo = chunk.strip().lower().replace("-", "_")
+        if topo and topo not in items:
+            items.append(topo)
+    return items
+
+
 KNOWN_TOPOLOGIES = ["abilene", "cernet", "geant", "ebone", "sprintlink", "tiscali"]
-UNSEEN_TOPOLOGIES = ["germany50", "vtlwavenet2011"]
+EXTRA_UNSEEN_TOPOLOGIES = _parse_extra_topologies(os.environ.get("GNNPLUS_EXTRA_UNSEEN_TOPOLOGIES", ""))
+UNSEEN_TOPOLOGIES = ["germany50", "vtlwavenet2011"] + [
+    topo for topo in EXTRA_UNSEEN_TOPOLOGIES if topo not in {"germany50", "vtlwavenet2011"}
+]
 ALL_TOPOLOGIES = KNOWN_TOPOLOGIES + UNSEEN_TOPOLOGIES
 CORE_METHODS = ["ecmp", "bottleneck", "gnn", "gnnplus"]
 RL_FAILURE_SCENARIOS = [
@@ -189,7 +202,7 @@ RL_FAILURE_SCENARIOS = [
     "capacity_degradation_50",
     "traffic_spike_2x",
 ]
-AGGRESSIVE_TIEBREAK_TOPOLOGIES = {"geant", "tiscali", "germany50", "vtlwavenet2011"}
+AGGRESSIVE_TIEBREAK_TOPOLOGIES = {"geant", "tiscali", "nobel_germany", *UNSEEN_TOPOLOGIES}
 
 TOPOLOGY_DISPLAY = {
     "abilene": "Abilene",
@@ -199,6 +212,7 @@ TOPOLOGY_DISPLAY = {
     "sprintlink": "Sprintlink",
     "tiscali": "Tiscali",
     "germany50": "Germany50",
+    "nobel_germany": "Nobel-Germany",
     "vtlwavenet2011": "VtlWavenet2011",
 }
 METHOD_LABELS = {
@@ -2843,7 +2857,7 @@ def gnnplus_select_stateful(
         active_mask=active_mask,
         k=k_crit,
         prev_selected_indicator=prev_selected_indicator,
-        continuity_bonus=0.0,
+        continuity_bonus=CONTINUITY_BONUS,
         tie_break_eps=effective_tie_eps,
         candidate_od_indices=candidate_np,
         full_num_od=int(od_data.get("full_num_od", scores.size(0))),
@@ -2930,7 +2944,7 @@ def calibrate_inference_controls(model: GNNPlusFlowSelector, val_samples: list[d
                         active_mask=selection_active_mask(sample),
                         k=K_CRIT,
                         prev_selected_indicator=sample["prev_selected_indicator"],
-                        continuity_bonus=0.0,
+                        continuity_bonus=CONTINUITY_BONUS,
                         candidate_od_indices=candidate_np,
                         full_num_od=int(od_data.get("full_num_od", scores.size(0))),
                     )
@@ -3022,7 +3036,38 @@ def apply_do_no_harm_gate(
     guard_bottleneck_selected: list[int] | None = None,
     guard_cache: dict | None = None,
     step_index: int | None = None,
-) -> tuple[list[int], object, dict, dict]:
+    guard_fallback_cooldown: int = 0,
+) -> tuple[list[int], object, dict, dict, int]:
+    cache = dict(guard_cache or {})
+    cooldown_remaining = max(int(guard_fallback_cooldown), 0)
+    cached_selected = [
+        int(od)
+        for od in cache.get("selected_ods", [])[: max(int(k_crit), 0)]
+    ]
+    if cooldown_remaining > 0 and cached_selected:
+        hold_lp = runner.solve_selected_path_lp_safe(
+            tm_vector=tm_vector,
+            selected_ods=cached_selected,
+            base_splits=base_splits,
+            path_library=path_library,
+            capacities=capacities,
+            warm_start_splits=warm_start_splits,
+            time_limit_sec=LP_TIME_LIMIT,
+            context=f"{context}:bottleneck_cooldown_hold",
+        )
+        cached_ref_mlu = cache.get("reference_mlu")
+        return cached_selected, hold_lp, {
+            "do_no_harm_fallback": False,
+            "do_no_harm_cooldown_hold": True,
+            "gnn_candidate_mlu": None,
+            "bottleneck_candidate_mlu": float(cached_ref_mlu) if cached_ref_mlu is not None else float(hold_lp.routing.mlu),
+            "do_no_harm_threshold": float(do_no_harm_threshold_for_topology(topology_key)),
+            "guard_overlap_ratio": None,
+            "guard_reference_source": "cooldown_hold",
+            "guard_reference_refreshed": False,
+            "guard_fallback_cooldown_remaining": max(cooldown_remaining - 1, 0),
+        }, cache, max(cooldown_remaining - 1, 0)
+
     threshold = do_no_harm_threshold_for_topology(topology_key)
     gnn_lp = runner.solve_selected_path_lp_safe(
         tm_vector=tm_vector,
@@ -3051,31 +3096,34 @@ def apply_do_no_harm_gate(
     if list(map(int, bottleneck_selected)) == list(map(int, selected_ods)):
         return selected_ods, gnn_lp, {
             "do_no_harm_fallback": False,
+            "do_no_harm_cooldown_hold": False,
             "gnn_candidate_mlu": float(gnn_est_mlu),
             "bottleneck_candidate_mlu": float(gnn_est_mlu),
             "do_no_harm_threshold": float(threshold),
             "guard_overlap_ratio": 1.0,
             "guard_reference_source": "same_selection",
             "guard_reference_refreshed": False,
+            "guard_fallback_cooldown_remaining": 0,
         }, {
             "reference_mlu": float(gnn_est_mlu),
             "selected_ods": list(map(int, bottleneck_selected)),
             "last_refresh_step": int(step_index) if step_index is not None else None,
-        }
+        }, 0
 
     overlap_ratio = selection_overlap_ratio(selected_ods, bottleneck_selected)
     if overlap_ratio >= float(DO_NO_HARM_OVERLAP_SKIP):
         return selected_ods, gnn_lp, {
             "do_no_harm_fallback": False,
+            "do_no_harm_cooldown_hold": False,
             "gnn_candidate_mlu": float(gnn_est_mlu),
             "bottleneck_candidate_mlu": None,
             "do_no_harm_threshold": float(threshold),
             "guard_overlap_ratio": float(overlap_ratio),
             "guard_reference_source": "skipped_high_overlap",
             "guard_reference_refreshed": False,
-        }, dict(guard_cache or {})
+            "guard_fallback_cooldown_remaining": 0,
+        }, cache, 0
 
-    cache = dict(guard_cache or {})
     refresh_due = (
         step_index is None
         or cache.get("reference_mlu") is None
@@ -3086,13 +3134,15 @@ def apply_do_no_harm_gate(
         cached_ref_mlu = float(cache["reference_mlu"])
         return selected_ods, gnn_lp, {
             "do_no_harm_fallback": False,
+            "do_no_harm_cooldown_hold": False,
             "gnn_candidate_mlu": float(gnn_est_mlu),
             "bottleneck_candidate_mlu": float(cached_ref_mlu),
             "do_no_harm_threshold": float(threshold),
             "guard_overlap_ratio": float(overlap_ratio),
             "guard_reference_source": "cached_periodic_reference",
             "guard_reference_refreshed": False,
-        }, cache
+            "guard_fallback_cooldown_remaining": 0,
+        }, cache, 0
 
     bn_lp = runner.solve_selected_path_lp_safe(
         tm_vector=tm_vector,
@@ -3113,22 +3163,26 @@ def apply_do_no_harm_gate(
     if gnn_est_mlu > float(threshold) * bn_est_mlu:
         return list(map(int, bottleneck_selected)), bn_lp, {
             "do_no_harm_fallback": True,
+            "do_no_harm_cooldown_hold": False,
             "gnn_candidate_mlu": float(gnn_est_mlu),
             "bottleneck_candidate_mlu": float(bn_est_mlu),
             "do_no_harm_threshold": float(threshold),
             "guard_overlap_ratio": float(overlap_ratio),
             "guard_reference_source": "current_bottleneck_refresh",
             "guard_reference_refreshed": True,
-        }, updated_cache
+            "guard_fallback_cooldown_remaining": int(DO_NO_HARM_FALLBACK_COOLDOWN),
+        }, updated_cache, int(DO_NO_HARM_FALLBACK_COOLDOWN)
     return selected_ods, gnn_lp, {
         "do_no_harm_fallback": False,
+        "do_no_harm_cooldown_hold": False,
         "gnn_candidate_mlu": float(gnn_est_mlu),
         "bottleneck_candidate_mlu": float(bn_est_mlu),
         "do_no_harm_threshold": float(threshold),
         "guard_overlap_ratio": float(overlap_ratio),
         "guard_reference_source": "current_bottleneck_refresh",
         "guard_reference_refreshed": True,
-    }, updated_cache
+        "guard_fallback_cooldown_remaining": 0,
+    }, updated_cache, 0
 
 
 def run_sdn_cycle_gnnplus_improved(
@@ -3177,7 +3231,7 @@ def run_sdn_cycle_gnnplus_improved(
         gate_temperature=controls["gate_temperature"],
         tie_break_eps=controls["tie_break_eps"],
     )
-    selected_ods, lp_result, gate_info, updated_guard_cache = apply_do_no_harm_gate(
+    selected_ods, lp_result, gate_info, updated_guard_cache, updated_guard_fallback_cooldown = apply_do_no_harm_gate(
         runner,
         tm_vector=np.asarray(tm_vector, dtype=float),
         selected_ods=selected_ods,
@@ -3191,6 +3245,7 @@ def run_sdn_cycle_gnnplus_improved(
         guard_bottleneck_selected=select_info.get("prefilter_bottleneck_selected", []),
         guard_cache=gnnplus_state.get("guard_cache", {}),
         step_index=int(gnnplus_state.get("guard_cycle_index", 0)),
+        guard_fallback_cooldown=int(gnnplus_state.get("guard_fallback_cooldown", 0)),
     )
     select_info.update(gate_info)
     new_splits = [s.copy() for s in lp_result.splits]
@@ -3240,6 +3295,7 @@ def run_sdn_cycle_gnnplus_improved(
         "select_info": dict(select_info),
         "guard_cache": dict(updated_guard_cache),
         "guard_cycle_index": int(gnnplus_state.get("guard_cycle_index", 0)) + 1,
+        "guard_fallback_cooldown": int(updated_guard_fallback_cooldown),
     }
     return result, new_splits, new_groups, telemetry_post.latency_by_od, next_state
 
@@ -3305,7 +3361,7 @@ def run_failure_scenario_gnnplus_improved(
         gate_temperature=controls["gate_temperature"],
         tie_break_eps=controls["tie_break_eps"],
     )
-    _, lp_result, gate_info, _ = apply_do_no_harm_gate(
+    _, lp_result, gate_info, _, _ = apply_do_no_harm_gate(
         runner,
         tm_vector=np.asarray(effective_tm, dtype=float),
         selected_ods=selected,
@@ -3354,6 +3410,7 @@ def benchmark_topology_normal_improved(runner, topo_key: str, gnn_cache: dict, g
                 "prev_disturbance": 0.0,
                 "guard_cache": {},
                 "guard_cycle_index": 0,
+                "guard_fallback_cooldown": 0,
             }
             for t_idx in test_indices:
                 tm_vec = dataset.tm[t_idx]
@@ -3577,7 +3634,7 @@ def run_proportional_budget_cycle(
             gate_temperature=controls["gate_temperature"],
             tie_break_eps=controls["tie_break_eps"],
         )
-        selected_ods, lp_result, gate_info, updated_guard_cache = apply_do_no_harm_gate(
+        selected_ods, lp_result, gate_info, updated_guard_cache, updated_guard_fallback_cooldown = apply_do_no_harm_gate(
             runner,
             tm_vector=np.asarray(tm_vector, dtype=float),
             selected_ods=selected_ods,
@@ -3591,6 +3648,7 @@ def run_proportional_budget_cycle(
             guard_bottleneck_selected=select_info.get("prefilter_bottleneck_selected", []),
             guard_cache=gnnplus_state.get("guard_cache", {}),
             step_index=int(gnnplus_state.get("guard_cycle_index", 0)),
+            guard_fallback_cooldown=int(gnnplus_state.get("guard_fallback_cooldown", 0)),
         )
         select_info.update(gate_info)
         new_splits = [s.copy() for s in lp_result.splits]
@@ -3602,6 +3660,7 @@ def run_proportional_budget_cycle(
             "select_info": dict(select_info),
             "guard_cache": dict(updated_guard_cache),
             "guard_cycle_index": int(gnnplus_state.get("guard_cycle_index", 0)) + 1,
+            "guard_fallback_cooldown": int(updated_guard_fallback_cooldown),
         }
     else:
         raise ValueError(f"Unsupported proportional-budget method: {method}")
@@ -3659,6 +3718,7 @@ def benchmark_proportional_budget_normal(runner, topo_key: str, gnnplus_model, r
                 "prev_disturbance": 0.0,
                 "guard_cache": {},
                 "guard_cycle_index": 0,
+                "guard_fallback_cooldown": 0,
             }
             for t_idx in test_indices:
                 tm_vec = np.asarray(dataset.tm[t_idx], dtype=float)
@@ -3828,7 +3888,7 @@ def benchmark_extreme_stress_vtlwavenet(runner, gnnplus_model, ratio: float, inf
                     gate_temperature=controls["gate_temperature"],
                     tie_break_eps=controls["tie_break_eps"],
                 )
-                _, lp_result, _, _ = apply_do_no_harm_gate(
+                _, lp_result, _, _, _ = apply_do_no_harm_gate(
                     runner,
                     topology_key=str(topo_key),
                     tm_vector=np.asarray(effective_tm, dtype=float),
@@ -4149,6 +4209,8 @@ def build_report(summary_df: pd.DataFrame, failure_df: pd.DataFrame, metrics_df:
     helper.PLOTS_DIR = PLOTS_DIR
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     helper.create_plots(summary_df, failure_df)
+    num_topologies = len(ALL_TOPOLOGIES)
+    unseen_display = ", ".join(TOPOLOGY_DISPLAY.get(topo, topo) for topo in UNSEEN_TOPOLOGIES)
 
     overall_compare = pd.read_csv(COMPARISON_DIR / "overall_bundle_comparison.csv")
     reference_dirs = available_reference_dirs()
@@ -4177,7 +4239,7 @@ def build_report(summary_df: pd.DataFrame, failure_df: pd.DataFrame, metrics_df:
         "Bottleneck, Original GNN, and GNN+ for the main benchmark."
     )
     add_bullet(doc, "Known training topologies remain the original six known topologies.")
-    add_bullet(doc, "Germany50 and VtlWavenet2011 remain unseen zero-shot evaluation topologies.")
+    add_bullet(doc, f"Unseen zero-shot evaluation topologies in this run: {unseen_display}.")
     add_bullet(doc, "No MetaGate, Stable MetaGate, or unseen-topology adaptation is used.")
     add_bullet(doc, "Gate-temperature calibration is fit only on known-topology validation slices; unseen topologies use the global default.")
     add_bullet(doc, "Section 1 selector engine fixes are locked before training: failure-path generator check and temporal failure gate.")
@@ -4296,10 +4358,10 @@ def build_report(summary_df: pd.DataFrame, failure_df: pd.DataFrame, metrics_df:
     helper.add_dataframe_table(doc, protocol_rows, font_size=9)
 
     doc.add_heading("5. Normal Results", level=1)
-    add_image(doc, PLOTS_DIR / "mlu_comparison_normal.png", "Figure 1. Mean MLU comparison across the 8 topologies.")
-    add_image(doc, PLOTS_DIR / "throughput_comparison_normal.png", "Figure 2. Throughput comparison across the 8 topologies.")
-    add_image(doc, PLOTS_DIR / "disturbance_comparison.png", "Figure 3. Disturbance comparison across the 8 topologies.")
-    add_image(doc, PLOTS_DIR / "decision_time_comparison.png", "Figure 4. Decision time comparison across the 8 topologies.")
+    add_image(doc, PLOTS_DIR / "mlu_comparison_normal.png", f"Figure 1. Mean MLU comparison across the {num_topologies} topologies.")
+    add_image(doc, PLOTS_DIR / "throughput_comparison_normal.png", f"Figure 2. Throughput comparison across the {num_topologies} topologies.")
+    add_image(doc, PLOTS_DIR / "disturbance_comparison.png", f"Figure 3. Disturbance comparison across the {num_topologies} topologies.")
+    add_image(doc, PLOTS_DIR / "decision_time_comparison.png", f"Figure 4. Decision time comparison across the {num_topologies} topologies.")
     helper.add_dataframe_table(doc, metrics_df, font_size=8)
 
     doc.add_heading("6. Failure Results", level=1)
@@ -4819,7 +4881,7 @@ def main() -> int:
         "main_reference_configuration": "step1to5_failgate",
         "feature_variant": FEATURE_VARIANT,
         "feature_profile": feature_profile_description(),
-        "continuity_bonus": 0.0,
+        "continuity_bonus": float(CONTINUITY_BONUS),
         "candidate_prefilter": {
             "enabled": bool(USE_CANDIDATE_PREFILTER),
             "multiplier": float(CANDIDATE_PREFILTER_MULTIPLIER),
