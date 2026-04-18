@@ -79,6 +79,7 @@ TOPOLOGY_ORDER = [
     "sprintlink",
     "tiscali",
     "germany50",
+    "nobel_germany",
     "vtlwavenet2011",
 ]
 TOPOLOGY_DISPLAY = {
@@ -89,6 +90,7 @@ TOPOLOGY_DISPLAY = {
     "sprintlink": "Sprintlink",
     "tiscali": "Tiscali",
     "germany50": "Germany50",
+    "nobel_germany": "Nobel-Germany",
     "vtlwavenet2011": "VtlWavenet2011",
 }
 SCENARIO_ORDER = [

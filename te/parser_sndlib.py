@@ -27,6 +27,10 @@ DATASET_SPECS = {
         "dynamic_archive": "directed-germany50-DFN-aggregated-5min-over-1day-native.tgz",
         "topology_file": "germany50.txt",
     },
+    "nobel_germany": {
+        "dynamic_archive": "directed-nobel-germany-DFN-aggregated-5min-over-1day-native.tgz",
+        "topology_file": "nobel-germany.txt",
+    },
 }
 
 

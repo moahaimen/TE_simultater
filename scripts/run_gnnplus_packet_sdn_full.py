@@ -584,8 +584,30 @@ def run_failure_scenario(
     # Run method under failure
     if method == "ecmp":
         recovery_splits = [s.copy() for s in effective_ecmp]
+    elif method == "ospf":
+        from te.baselines import ospf_splits
+
+        recovery_splits = ospf_splits(effective_path_library)
     elif method == "bottleneck":
         selected = select_bottleneck_critical(effective_tm, effective_ecmp, effective_path_library, effective_caps, K_CRIT)
+        lp_result = solve_selected_path_lp_safe(
+            tm_vector=effective_tm, selected_ods=selected, base_splits=effective_ecmp,
+            path_library=effective_path_library, capacities=effective_caps, time_limit_sec=20,
+            context=f"{dataset.key}:{scenario}:{method}",
+        )
+        recovery_splits = [s.copy() for s in lp_result.splits]
+    elif method == "topk":
+        selected = select_topk_by_demand(effective_tm, K_CRIT)
+        lp_result = solve_selected_path_lp_safe(
+            tm_vector=effective_tm, selected_ods=selected, base_splits=effective_ecmp,
+            path_library=effective_path_library, capacities=effective_caps, time_limit_sec=20,
+            context=f"{dataset.key}:{scenario}:{method}",
+        )
+        recovery_splits = [s.copy() for s in lp_result.splits]
+    elif method == "sensitivity":
+        selected = select_sensitivity_critical(
+            effective_tm, effective_ecmp, effective_path_library, effective_caps, K_CRIT
+        )
         lp_result = solve_selected_path_lp_safe(
             tm_vector=effective_tm, selected_ods=selected, base_splits=effective_ecmp,
             path_library=effective_path_library, capacities=effective_caps, time_limit_sec=20,

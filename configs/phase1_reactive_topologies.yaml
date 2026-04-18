@@ -29,6 +29,16 @@ topologies:
     expected_num_nodes: 50
     expected_num_edges: 176
 
+  - key: nobel_germany_real
+    dataset_key: nobel_germany
+    display_name: "Nobel-Germany (SNDlib real traffic)"
+    source: sndlib
+    topology_file: data/raw/topology/nobel-germany.txt
+    processed_file: nobel_germany.npz
+    traffic_mode: real_sndlib
+    expected_num_nodes: 17
+    expected_num_edges: 52
+
   - key: ebone
     dataset_key: rocketfuel_ebone
     display_name: "Ebone (Rocketfuel)"

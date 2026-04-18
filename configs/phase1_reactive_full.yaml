@@ -30,6 +30,7 @@ experiment:
     - tiscali
   generalization_topologies:
     - germany50_real
+    - nobel_germany_real
     - vtlwavenet2011
   methods:
     - ospf
