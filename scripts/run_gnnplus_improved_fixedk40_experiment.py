@@ -1922,6 +1922,19 @@ def load_final_checkpoint_summary() -> tuple[GNNPlusFlowSelector, dict]:
     elif not FINAL_CKPT.exists():
         raise FileNotFoundError(f"Missing final checkpoint: {FINAL_CKPT}")
     model, _ = load_gnn_plus(FINAL_CKPT, device=DEVICE)
+    # Rescue branch (gnnplus-debug-rescue): honor env-var override on the
+    # eval_reuse_final path. Without this, GNNPLUS_BOTTLENECK_MOE_FLOOR is a
+    # silent no-op because load_gnn_plus reconstructs cfg straight from the
+    # saved checkpoint. The override at main-script line 1304 only fires on
+    # the fresh-model path.
+    _prev_moe_floor = float(getattr(model.cfg, "bottleneck_moe_floor", 0.10))
+    if abs(_prev_moe_floor - float(BOTTLENECK_MOE_FLOOR)) > 1e-12:
+        model.cfg.bottleneck_moe_floor = float(BOTTLENECK_MOE_FLOOR)
+        print(
+            f"[rescue] Overrode checkpoint bottleneck_moe_floor "
+            f"{_prev_moe_floor:.4f} -> {float(BOTTLENECK_MOE_FLOOR):.4f} "
+            f"(env GNNPLUS_BOTTLENECK_MOE_FLOOR)"
+        )
     if TRAINING_SUMMARY_JSON.exists():
         summary = json.loads(TRAINING_SUMMARY_JSON.read_text(encoding="utf-8"))
     else:
