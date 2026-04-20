@@ -85,7 +85,9 @@ from te.simulator import apply_routing  # noqa: E402
 SEED = 42
 DEVICE = "cpu"
 K_CRIT = 40
-LP_TIME_LIMIT = 20
+# Rescue branch (gnnplus-debug-rescue): env-var-configurable for Check #5
+# (split train LP budget from eval LP budget). Default 20 preserves Task A.
+LP_TIME_LIMIT = int(os.environ.get("GNNPLUS_LP_TIME_LIMIT", "20"))
 NUM_RUNS = 3
 PROPORTIONAL_NUM_RUNS = 1
 TRAIN_MAX_PER_TOPO = 200

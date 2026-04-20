@@ -264,6 +264,9 @@ def gnn_select_critical(model, dataset, path_library, tm_vector, k_crit=K_CRIT):
         return selected
 
 
+_RESCUE_LP_TIME_LIMIT_OVERRIDE_WARNED = False
+
+
 def solve_selected_path_lp_safe(
     *,
     tm_vector,
@@ -275,6 +278,26 @@ def solve_selected_path_lp_safe(
     context,
     warm_start_splits=None,
 ):
+    # Rescue branch (gnnplus-debug-rescue): env-var override for Check #5
+    # (split train LP budget from eval LP budget). All 11 runner call sites
+    # pass time_limit_sec=20 literal, so this wrapper is the single choke-
+    # point for an inference-time override.
+    global _RESCUE_LP_TIME_LIMIT_OVERRIDE_WARNED
+    _rescue_env = os.environ.get("GNNPLUS_LP_TIME_LIMIT")
+    if _rescue_env is not None:
+        try:
+            _rescue_v = int(_rescue_env)
+        except ValueError:
+            _rescue_v = None
+        if _rescue_v is not None and _rescue_v != int(time_limit_sec):
+            if not _RESCUE_LP_TIME_LIMIT_OVERRIDE_WARNED:
+                print(
+                    f"[rescue] Overriding runner LP time_limit_sec "
+                    f"{int(time_limit_sec)} -> {_rescue_v} "
+                    f"(env GNNPLUS_LP_TIME_LIMIT). First override only is logged."
+                )
+                _RESCUE_LP_TIME_LIMIT_OVERRIDE_WARNED = True
+            time_limit_sec = _rescue_v
     assert_selected_ods_have_paths(path_library, selected_ods, context=context)
     return solve_selected_path_lp(
         tm_vector=tm_vector,
