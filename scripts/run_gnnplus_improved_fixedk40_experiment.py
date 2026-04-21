@@ -164,6 +164,8 @@ DO_NO_HARM_THRESHOLD_UNSEEN = float(os.environ.get("GNNPLUS_DO_NO_HARM_THRESHOLD
 DO_NO_HARM_CACHE_STEPS = int(os.environ.get("GNNPLUS_DO_NO_HARM_CACHE_STEPS", "20"))
 DO_NO_HARM_FALLBACK_COOLDOWN = int(os.environ.get("GNNPLUS_DO_NO_HARM_FALLBACK_COOLDOWN", "4"))
 DO_NO_HARM_OVERLAP_SKIP = float(os.environ.get("GNNPLUS_DO_NO_HARM_OVERLAP_SKIP", "0.90"))
+STICKY_EPS = float(os.environ.get("GNNPLUS_STICKY_EPS", "0.0"))
+DISTURB_TIEBREAK_EPS = float(os.environ.get("GNNPLUS_DISTURB_TIEBREAK_EPS", "0.0"))
 CALIBRATION_MAX_SAMPLES_PER_TOPO = int(os.environ.get("GNNPLUS_CALIBRATION_MAX_SAMPLES_PER_TOPO", "200"))
 SUP_LP_GAP_MEAN_GATE = float(os.environ.get("GNNPLUS_SUP_LP_GAP_MEAN_GATE", "0.03"))
 SUP_LP_GAP_P95_GATE = float(os.environ.get("GNNPLUS_SUP_LP_GAP_P95_GATE", "0.06"))
@@ -3036,6 +3038,52 @@ def calibrate_inference_controls(model: GNNPlusFlowSelector, val_samples: list[d
     return calibration
 
 
+_STICKY_OVERRIDE_LOGGED = False
+_DISTURB_TIEBREAK_LOGGED = False
+
+
+def _sticky_compose_selection(
+    *,
+    selected_ods: list[int],
+    prev_selected_ods: list[int],
+    path_library,
+    tm_vector: np.ndarray,
+    k_crit: int,
+) -> list[int]:
+    """Build sticky selection: keep prev-selected ODs that are still active,
+    top up from the fresh GNN+ selection (preserving order) to reach k_crit.
+
+    Returns an empty list if the sticky choice would be identical to the
+    fresh selection (caller should skip the LP solve in that case).
+    """
+    k = max(int(k_crit), 0)
+    if k <= 0 or not prev_selected_ods:
+        return []
+    tm_arr = np.asarray(tm_vector, dtype=np.float64)
+    active_mask = (tm_arr > 1e-12) & surviving_od_mask(path_library)
+    active_set = set(int(od) for od in np.where(active_mask)[0].tolist())
+    fresh_order = [int(od) for od in selected_ods]
+    fresh_set = set(fresh_order)
+    sticky_prev = [int(od) for od in prev_selected_ods if int(od) in active_set]
+    # Stable unique-preserving order on prev.
+    seen = set()
+    sticky_prev_unique: list[int] = []
+    for od in sticky_prev:
+        if od not in seen:
+            sticky_prev_unique.append(od)
+            seen.add(od)
+    sticky_prev_unique = sticky_prev_unique[:k]
+    if len(sticky_prev_unique) >= k:
+        sticky = sticky_prev_unique
+    else:
+        remaining = k - len(sticky_prev_unique)
+        topup = [od for od in fresh_order if od not in seen][:remaining]
+        sticky = sticky_prev_unique + topup
+    if set(sticky) == fresh_set:
+        return []
+    return sticky
+
+
 def apply_do_no_harm_gate(
     runner,
     *,
@@ -3052,9 +3100,11 @@ def apply_do_no_harm_gate(
     guard_cache: dict | None = None,
     step_index: int | None = None,
     guard_fallback_cooldown: int = 0,
+    prev_selected_ods: list[int] | None = None,
 ) -> tuple[list[int], object, dict, dict, int]:
     cache = dict(guard_cache or {})
     cooldown_remaining = max(int(guard_fallback_cooldown), 0)
+    sticky_applied = False
     cached_selected = [
         int(od)
         for od in cache.get("selected_ods", [])[: max(int(k_crit), 0)]
@@ -3080,6 +3130,7 @@ def apply_do_no_harm_gate(
             "guard_overlap_ratio": None,
             "guard_reference_source": "cooldown_hold",
             "guard_reference_refreshed": False,
+            "sticky_applied": False,
             "guard_fallback_cooldown_remaining": max(cooldown_remaining - 1, 0),
         }, cache, max(cooldown_remaining - 1, 0)
 
@@ -3095,6 +3146,57 @@ def apply_do_no_harm_gate(
         context=f"{context}:gnnplus_candidate",
     )
     gnn_est_mlu = float(gnn_lp.routing.mlu)
+
+    # [Phase 1 / rescue] Sticky-selection post-filter: if a prev-selected
+    # set is available and STICKY_EPS > 0, see if keeping previously-
+    # selected ODs (filled up with fresh GNN+ picks) costs negligible MLU.
+    # If so, prefer the sticky selection (lower disturbance) as GNN+'s
+    # candidate for the do-no-harm comparison below.
+    if (
+        STICKY_EPS > 0.0
+        and prev_selected_ods
+        and len(selected_ods) > 0
+    ):
+        sticky_ods = _sticky_compose_selection(
+            selected_ods=selected_ods,
+            prev_selected_ods=list(prev_selected_ods),
+            path_library=path_library,
+            tm_vector=np.asarray(tm_vector, dtype=float),
+            k_crit=int(k_crit),
+        )
+        if sticky_ods:
+            try:
+                sticky_lp = runner.solve_selected_path_lp_safe(
+                    tm_vector=tm_vector,
+                    selected_ods=sticky_ods,
+                    base_splits=base_splits,
+                    path_library=path_library,
+                    capacities=capacities,
+                    warm_start_splits=warm_start_splits,
+                    time_limit_sec=LP_TIME_LIMIT,
+                    context=f"{context}:gnnplus_sticky_candidate",
+                )
+                sticky_mlu = float(sticky_lp.routing.mlu)
+                # Sticky wins if it is no worse than (1 + STICKY_EPS) times
+                # the fresh MLU; this is a pure Pareto-preference for lower
+                # disturbance at a bounded MLU cost.
+                if sticky_mlu <= gnn_est_mlu * (1.0 + float(STICKY_EPS)) + 1e-12:
+                    global _STICKY_OVERRIDE_LOGGED
+                    if not _STICKY_OVERRIDE_LOGGED:
+                        print(
+                            f"[sticky] Applied sticky post-filter: "
+                            f"fresh_mlu={gnn_est_mlu:.6f} sticky_mlu={sticky_mlu:.6f} "
+                            f"eps={float(STICKY_EPS):.4f} context={context}. "
+                            f"First sticky override only is logged."
+                        )
+                        _STICKY_OVERRIDE_LOGGED = True
+                    selected_ods = list(sticky_ods)
+                    gnn_lp = sticky_lp
+                    gnn_est_mlu = sticky_mlu
+                    sticky_applied = True
+            except Exception:
+                # Sticky is a nice-to-have; never fail the cycle because of it.
+                pass
 
     bottleneck_selected = [
         int(od)
@@ -3118,6 +3220,7 @@ def apply_do_no_harm_gate(
             "guard_overlap_ratio": 1.0,
             "guard_reference_source": "same_selection",
             "guard_reference_refreshed": False,
+            "sticky_applied": bool(sticky_applied),
             "guard_fallback_cooldown_remaining": 0,
         }, {
             "reference_mlu": float(gnn_est_mlu),
@@ -3136,6 +3239,7 @@ def apply_do_no_harm_gate(
             "guard_overlap_ratio": float(overlap_ratio),
             "guard_reference_source": "skipped_high_overlap",
             "guard_reference_refreshed": False,
+            "sticky_applied": bool(sticky_applied),
             "guard_fallback_cooldown_remaining": 0,
         }, cache, 0
 
@@ -3156,6 +3260,7 @@ def apply_do_no_harm_gate(
             "guard_overlap_ratio": float(overlap_ratio),
             "guard_reference_source": "cached_periodic_reference",
             "guard_reference_refreshed": False,
+            "sticky_applied": bool(sticky_applied),
             "guard_fallback_cooldown_remaining": 0,
         }, cache, 0
 
@@ -3175,6 +3280,52 @@ def apply_do_no_harm_gate(
         "selected_ods": list(map(int, bottleneck_selected)),
         "last_refresh_step": int(step_index) if step_index is not None else None,
     }
+    # [Phase 1 / rescue] Disturbance-aware do-no-harm tiebreak: if the two
+    # candidates are within DISTURB_TIEBREAK_EPS on MLU, prefer the one
+    # that produces fewer flow changes against the currently-applied
+    # splits (warm_start_splits). Tiebreak to GNN+ on exact equality to
+    # preserve existing behavior.
+    if (
+        DISTURB_TIEBREAK_EPS > 0.0
+        and bn_est_mlu > 1e-12
+        and warm_start_splits is not None
+    ):
+        rel_gap = abs(gnn_est_mlu - bn_est_mlu) / float(bn_est_mlu)
+        if rel_gap <= float(DISTURB_TIEBREAK_EPS):
+            try:
+                gnn_dist = float(compute_disturbance(
+                    warm_start_splits, gnn_lp.splits, tm_vector
+                ))
+                bn_dist = float(compute_disturbance(
+                    warm_start_splits, bn_lp.splits, tm_vector
+                ))
+            except Exception:
+                gnn_dist = float("inf")
+                bn_dist = float("inf")
+            if bn_dist + 1e-12 < gnn_dist:
+                global _DISTURB_TIEBREAK_LOGGED
+                if not _DISTURB_TIEBREAK_LOGGED:
+                    print(
+                        f"[disturb-tiebreak] Near-tie resolved to bottleneck: "
+                        f"gnn_mlu={gnn_est_mlu:.6f} bn_mlu={bn_est_mlu:.6f} "
+                        f"gnn_dist={gnn_dist:.6f} bn_dist={bn_dist:.6f} "
+                        f"eps={float(DISTURB_TIEBREAK_EPS):.4f} context={context}. "
+                        f"First tiebreak only is logged."
+                    )
+                    _DISTURB_TIEBREAK_LOGGED = True
+                return list(map(int, bottleneck_selected)), bn_lp, {
+                    "do_no_harm_fallback": True,
+                    "do_no_harm_cooldown_hold": False,
+                    "gnn_candidate_mlu": float(gnn_est_mlu),
+                    "bottleneck_candidate_mlu": float(bn_est_mlu),
+                    "do_no_harm_threshold": float(threshold),
+                    "guard_overlap_ratio": float(overlap_ratio),
+                    "guard_reference_source": "disturb_tiebreak_bottleneck",
+                    "guard_reference_refreshed": True,
+                    "sticky_applied": bool(sticky_applied),
+                    "guard_fallback_cooldown_remaining": int(DO_NO_HARM_FALLBACK_COOLDOWN),
+                }, updated_cache, int(DO_NO_HARM_FALLBACK_COOLDOWN)
+
     if gnn_est_mlu > float(threshold) * bn_est_mlu:
         return list(map(int, bottleneck_selected)), bn_lp, {
             "do_no_harm_fallback": True,
@@ -3185,6 +3336,7 @@ def apply_do_no_harm_gate(
             "guard_overlap_ratio": float(overlap_ratio),
             "guard_reference_source": "current_bottleneck_refresh",
             "guard_reference_refreshed": True,
+            "sticky_applied": bool(sticky_applied),
             "guard_fallback_cooldown_remaining": int(DO_NO_HARM_FALLBACK_COOLDOWN),
         }, updated_cache, int(DO_NO_HARM_FALLBACK_COOLDOWN)
     return selected_ods, gnn_lp, {
@@ -3196,6 +3348,7 @@ def apply_do_no_harm_gate(
         "guard_overlap_ratio": float(overlap_ratio),
         "guard_reference_source": "current_bottleneck_refresh",
         "guard_reference_refreshed": True,
+        "sticky_applied": bool(sticky_applied),
         "guard_fallback_cooldown_remaining": 0,
     }, updated_cache, 0
 
@@ -3246,6 +3399,11 @@ def run_sdn_cycle_gnnplus_improved(
         gate_temperature=controls["gate_temperature"],
         tie_break_eps=controls["tie_break_eps"],
     )
+    _prev_indicator = gnnplus_state.get("prev_selected_indicator")
+    prev_selected_ods_list: list[int] = []
+    if _prev_indicator is not None:
+        _prev_arr = np.asarray(_prev_indicator, dtype=np.float32).reshape(-1)
+        prev_selected_ods_list = [int(i) for i in np.where(_prev_arr > 0.5)[0].tolist()]
     selected_ods, lp_result, gate_info, updated_guard_cache, updated_guard_fallback_cooldown = apply_do_no_harm_gate(
         runner,
         tm_vector=np.asarray(tm_vector, dtype=float),
@@ -3261,6 +3419,7 @@ def run_sdn_cycle_gnnplus_improved(
         guard_cache=gnnplus_state.get("guard_cache", {}),
         step_index=int(gnnplus_state.get("guard_cycle_index", 0)),
         guard_fallback_cooldown=int(gnnplus_state.get("guard_fallback_cooldown", 0)),
+        prev_selected_ods=prev_selected_ods_list,
     )
     select_info.update(gate_info)
     new_splits = [s.copy() for s in lp_result.splits]
@@ -3649,6 +3808,11 @@ def run_proportional_budget_cycle(
             gate_temperature=controls["gate_temperature"],
             tie_break_eps=controls["tie_break_eps"],
         )
+        _prev_indicator_ratio = gnnplus_state.get("prev_selected_indicator")
+        prev_selected_ods_ratio: list[int] = []
+        if _prev_indicator_ratio is not None:
+            _prev_arr_ratio = np.asarray(_prev_indicator_ratio, dtype=np.float32).reshape(-1)
+            prev_selected_ods_ratio = [int(i) for i in np.where(_prev_arr_ratio > 0.5)[0].tolist()]
         selected_ods, lp_result, gate_info, updated_guard_cache, updated_guard_fallback_cooldown = apply_do_no_harm_gate(
             runner,
             tm_vector=np.asarray(tm_vector, dtype=float),
@@ -3664,6 +3828,7 @@ def run_proportional_budget_cycle(
             guard_cache=gnnplus_state.get("guard_cache", {}),
             step_index=int(gnnplus_state.get("guard_cycle_index", 0)),
             guard_fallback_cooldown=int(gnnplus_state.get("guard_fallback_cooldown", 0)),
+            prev_selected_ods=prev_selected_ods_ratio,
         )
         select_info.update(gate_info)
         new_splits = [s.copy() for s in lp_result.splits]
