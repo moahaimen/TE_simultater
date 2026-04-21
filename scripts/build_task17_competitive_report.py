@@ -54,6 +54,26 @@ TOP_ORDER = [
     "vtlwavenet2011",
 ]
 
+TOPOLOGY_METADATA = {
+    "abilene": {"source": "SNDlib", "traffic": "Real Measured TMs (SNDlib)"},
+    "cernet": {"source": "TopologyZoo", "traffic": "Synthetic MGM"},
+    "geant": {"source": "SNDlib", "traffic": "Real Measured TMs (SNDlib)"},
+    "ebone": {"source": "Rocketfuel", "traffic": "Synthetic MGM"},
+    "sprintlink": {"source": "Rocketfuel", "traffic": "Synthetic MGM"},
+    "tiscali": {"source": "Rocketfuel", "traffic": "Synthetic MGM"},
+    "germany50": {"source": "SNDlib", "traffic": "Real Measured TMs (SNDlib)"},
+    "vtlwavenet2011": {"source": "TopologyZoo", "traffic": "Synthetic MGM"},
+}
+
+REQUESTED_TOPOLOGY_NOT_EVALUATED = {
+    "name": "Nobel-Germany",
+    "nodes": 17,
+    "directed_links": 52,
+    "source": "SNDlib",
+    "traffic": "Real Measured TMs (SNDlib)",
+    "status": "Requested metadata only; not present as a local runnable dataset in this bundle",
+}
+
 
 def load_helper():
     spec = importlib.util.spec_from_file_location("task17_report_helper", HELPER_PATH)
@@ -191,6 +211,41 @@ def build_scope_table(training_summary: dict) -> pd.DataFrame:
     )
 
 
+def build_topology_inventory_table(summary_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    topo_rows = (
+        summary_df[["topology", "status", "nodes", "edges"]]
+        .drop_duplicates()
+        .set_index("topology")
+    )
+    for topo in TOP_ORDER:
+        meta = TOPOLOGY_METADATA[topo]
+        row = topo_rows.loc[topo]
+        rows.append(
+            {
+                "Topology": TOPOLOGY_LABELS[topo],
+                "Nodes": int(row["nodes"]),
+                "Directed links": int(row["edges"]),
+                "Status": row["status"],
+                "Source": meta["source"],
+                "Traffic Type": meta["traffic"],
+                "Evaluated": "Yes",
+            }
+        )
+    rows.append(
+        {
+            "Topology": REQUESTED_TOPOLOGY_NOT_EVALUATED["name"],
+            "Nodes": REQUESTED_TOPOLOGY_NOT_EVALUATED["nodes"],
+            "Directed links": REQUESTED_TOPOLOGY_NOT_EVALUATED["directed_links"],
+            "Status": REQUESTED_TOPOLOGY_NOT_EVALUATED["status"],
+            "Source": REQUESTED_TOPOLOGY_NOT_EVALUATED["source"],
+            "Traffic Type": REQUESTED_TOPOLOGY_NOT_EVALUATED["traffic"],
+            "Evaluated": "No",
+        }
+    )
+    return pd.DataFrame(rows)
+
+
 def build_method_changes_table() -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -240,6 +295,11 @@ def build_report() -> Path:
     add_bullet(doc, "Packet-level SDN metrics in this report are model-based analytical metrics, not live Mininet measurements.")
     add_bullet(doc, "Germany50 and VtlWavenet2011 remain pure unseen evaluation topologies in this branch.")
     add_bullet(doc, "No MetaGate, no Stable MetaGate, and no Bayesian calibration are used in this report.")
+    doc.add_paragraph(
+        "The topology inventory below distinguishes the eight topologies actually evaluated in this Task 17 bundle from one additional student-requested metadata row. "
+        "Nobel-Germany is documented here with the requested source and size information, but it is not counted in the benchmark because no local processed dataset or topology file for that name exists in this repository."
+    )
+    helper.add_dataframe_table(doc, build_topology_inventory_table(summary_df), title="Topology inventory and requested addendum", font_size=8)
 
     doc.add_heading("3. What Changed in This Final Branch", level=1)
     helper.add_dataframe_table(doc, build_method_changes_table(), font_size=9)
