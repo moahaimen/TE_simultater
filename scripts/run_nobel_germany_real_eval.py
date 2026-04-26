@@ -34,8 +34,11 @@ PLOTS_DIR = OUT_DIR / "plots"
 SUMMARY_CSV = OUT_DIR / "packet_sdn_summary.csv"
 FAILURE_CSV = OUT_DIR / "packet_sdn_failure.csv"
 METRICS_CSV = OUT_DIR / "packet_sdn_sdn_metrics.csv"
+TIMESERIES_CSV = OUT_DIR / "packet_sdn_timeseries.csv"
+FAILURE_TIMESERIES_CSV = OUT_DIR / "packet_sdn_failure_timeseries.csv"
 REPORT_DOCX = OUT_DIR / "GNNPLUS_NOBEL_GERMANY_FULL_BASELINES_REPORT.docx"
 AUDIT_MD = OUT_DIR / "nobel_germany_run_audit.md"
+SAVE_PACKET_SDN_TIMESERIES = os.environ.get("GNNPLUS_SAVE_PACKET_SDN_TIMESERIES", "0") == "1"
 
 SOURCE_TAG = os.environ.get("GNNPLUS_NOBEL_SOURCE_TAG", "gnnplus_task17_tiebreak_eval")
 SOURCE_DIR = PROJECT_ROOT / "results" / SOURCE_TAG
@@ -69,15 +72,15 @@ METHOD_COLORS = {
 }
 SCENARIO_ORDER = [
     "single_link_failure",
-    "random_link_failure_1",
-    "random_link_failure_2",
+    "multiple_link_failure",
+    "three_link_failure",
     "capacity_degradation_50",
     "traffic_spike_2x",
 ]
 SCENARIO_LABELS = {
     "single_link_failure": "Single Link Failure",
-    "random_link_failure_1": "Random Link Failure (1)",
-    "random_link_failure_2": "Random Link Failure (2)",
+    "multiple_link_failure": "Multiple Link Failure (2 Links)",
+    "three_link_failure": "3-Link Failure",
     "capacity_degradation_50": "Capacity Degradation (50%)",
     "traffic_spike_2x": "Traffic Spike (2x)",
 }
@@ -267,7 +270,7 @@ def prepare_sdn_metrics(summary_df: pd.DataFrame, failure_df: pd.DataFrame) -> p
     return metrics[cols]
 
 
-def benchmark_nobel_normal(runner, improved, *, gnnplus_model, inference_calibration: dict) -> pd.DataFrame:
+def benchmark_nobel_normal(runner, improved, *, gnnplus_model, inference_calibration: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     dataset, path_library = runner.load_dataset(TOPO_KEY)
     capacities = np.asarray(dataset.capacities, dtype=float)
     weights = np.asarray(dataset.weights, dtype=float)
@@ -277,10 +280,11 @@ def benchmark_nobel_normal(runner, improved, *, gnnplus_model, inference_calibra
 
     gnn_model = runner.load_gnn_model(dataset, path_library)
     rows: list[dict] = []
+    ts_rows: list[dict] = []
 
     for method in METHOD_ORDER:
         run_results = defaultdict(list)
-        for _ in range(runner.NUM_RUNS):
+        for run_id in range(runner.NUM_RUNS):
             current_splits = [split.copy() for split in ecmp_base]
             current_groups, _ = runner.build_ecmp_baseline_rules(path_library, topo_mapping, dataset.edges)
             prev_latency = None
@@ -311,9 +315,8 @@ def benchmark_nobel_normal(runner, improved, *, gnnplus_model, inference_calibra
                         gnnplus_state=gnnplus_state,
                         inference_calibration=inference_calibration,
                     )
-                    run_results["do_no_harm_fallbacks"].append(
-                        float(bool(gnnplus_state.get("select_info", {}).get("do_no_harm_fallback", False)))
-                    )
+                    do_no_harm_fallback = float(bool(gnnplus_state.get("select_info", {}).get("do_no_harm_fallback", False)))
+                    run_results["do_no_harm_fallbacks"].append(do_no_harm_fallback)
                 else:
                     result, current_splits, current_groups, prev_latency = runner.run_sdn_cycle(
                         tm_vector=tm_vec,
@@ -330,7 +333,8 @@ def benchmark_nobel_normal(runner, improved, *, gnnplus_model, inference_calibra
                         gnnplus_model=None,
                         prev_latency_by_od=prev_latency,
                     )
-                    run_results["do_no_harm_fallbacks"].append(0.0)
+                    do_no_harm_fallback = 0.0
+                    run_results["do_no_harm_fallbacks"].append(do_no_harm_fallback)
                 run_results["post_mlus"].append(result.post_mlu)
                 run_results["disturbances"].append(result.disturbance)
                 run_results["throughputs"].append(result.throughput)
@@ -341,6 +345,28 @@ def benchmark_nobel_normal(runner, improved, *, gnnplus_model, inference_calibra
                 run_results["decision_times"].append(result.decision_time_ms)
                 run_results["flow_updates"].append(result.flow_table_updates)
                 run_results["rule_delays"].append(result.rule_install_delay_ms)
+                if SAVE_PACKET_SDN_TIMESERIES:
+                    ts_rows.append(
+                        {
+                            "topology": TOPO_KEY,
+                            "status": "unseen",
+                            "method": method,
+                            "scenario": "normal",
+                            "run_id": int(run_id),
+                            "timestep": int(t_idx),
+                            "mlu": float(result.post_mlu),
+                            "disturbance": float(result.disturbance),
+                            "throughput": float(result.throughput),
+                            "mean_latency_au": float(result.mean_latency),
+                            "p95_latency_au": float(result.p95_latency),
+                            "packet_loss": float(result.packet_loss),
+                            "jitter_au": float(result.jitter),
+                            "decision_time_ms": float(result.decision_time_ms),
+                            "flow_table_updates": float(result.flow_table_updates),
+                            "rule_install_delay_ms": float(result.rule_install_delay_ms),
+                            "do_no_harm_fallback": float(do_no_harm_fallback),
+                        }
+                    )
 
         row = {
             "topology": TOPO_KEY,
@@ -364,10 +390,10 @@ def benchmark_nobel_normal(runner, improved, *, gnnplus_model, inference_calibra
         rows.append(row)
         print(f"[nobel:normal] {method} mean_mlu={row['mean_mlu']:.6f}", flush=True)
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), pd.DataFrame(ts_rows)
 
 
-def benchmark_nobel_failures(runner, improved, *, gnnplus_model, inference_calibration: dict) -> pd.DataFrame:
+def benchmark_nobel_failures(runner, improved, *, gnnplus_model, inference_calibration: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     dataset, path_library = runner.load_dataset(TOPO_KEY)
     capacities = np.asarray(dataset.capacities, dtype=float)
     weights = np.asarray(dataset.weights, dtype=float)
@@ -377,6 +403,7 @@ def benchmark_nobel_failures(runner, improved, *, gnnplus_model, inference_calib
     gnn_model = runner.load_gnn_model(dataset, path_library)
 
     rows: list[dict] = []
+    ts_rows: list[dict] = []
     for scenario in SCENARIO_ORDER:
         for method in METHOD_ORDER:
             run_results = defaultdict(list)
@@ -395,7 +422,8 @@ def benchmark_nobel_failures(runner, improved, *, gnnplus_model, inference_calib
                         gnnplus_model=gnnplus_model,
                         inference_calibration=inference_calibration,
                     )
-                    run_results["do_no_harm_fallbacks"].append(float(bool(select_info.get("do_no_harm_fallback", False))))
+                    do_no_harm_fallback = float(bool(select_info.get("do_no_harm_fallback", False)))
+                    run_results["do_no_harm_fallbacks"].append(do_no_harm_fallback)
                 else:
                     recovery_ms, pre_mlu, post_mlu, _ = runner.run_failure_scenario(
                         scenario=scenario,
@@ -410,10 +438,25 @@ def benchmark_nobel_failures(runner, improved, *, gnnplus_model, inference_calib
                         gnn_model=gnn_model,
                         gnnplus_model=None,
                     )
-                    run_results["do_no_harm_fallbacks"].append(0.0)
+                    do_no_harm_fallback = 0.0
+                    run_results["do_no_harm_fallbacks"].append(do_no_harm_fallback)
                 run_results["recovery_times"].append(recovery_ms)
                 run_results["pre_mlus"].append(pre_mlu)
                 run_results["post_mlus"].append(post_mlu)
+                if SAVE_PACKET_SDN_TIMESERIES:
+                    ts_rows.append(
+                        {
+                            "topology": TOPO_KEY,
+                            "status": "unseen",
+                            "method": method,
+                            "scenario": scenario,
+                            "timestep": int(t_idx),
+                            "pre_failure_mlu": float(pre_mlu),
+                            "post_recovery_mlu": float(post_mlu),
+                            "failure_recovery_ms": float(recovery_ms),
+                            "do_no_harm_fallback": float(do_no_harm_fallback),
+                        }
+                    )
 
             row = {
                 "topology": TOPO_KEY,
@@ -430,7 +473,7 @@ def benchmark_nobel_failures(runner, improved, *, gnnplus_model, inference_calib
             rows.append(row)
             print(f"[nobel:failure] {scenario} {method} mean_mlu={row['mean_mlu']:.6f}", flush=True)
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), pd.DataFrame(ts_rows)
 
 
 def build_report(helper, summary_df: pd.DataFrame, failure_df: pd.DataFrame, metrics_df: pd.DataFrame) -> None:
@@ -637,13 +680,13 @@ def main() -> int:
     gnnplus_model, _ = load_gnn_plus(CHECKPOINT_PATH, device="cpu")
     inference_calibration = json.loads(INFERENCE_CALIBRATION_JSON.read_text(encoding="utf-8"))
 
-    summary_df = benchmark_nobel_normal(
+    summary_df, summary_ts_df = benchmark_nobel_normal(
         runner,
         improved,
         gnnplus_model=gnnplus_model,
         inference_calibration=inference_calibration,
     )
-    failure_df = benchmark_nobel_failures(
+    failure_df, failure_ts_df = benchmark_nobel_failures(
         runner,
         improved,
         gnnplus_model=gnnplus_model,
@@ -654,6 +697,10 @@ def main() -> int:
     summary_df.to_csv(SUMMARY_CSV, index=False)
     failure_df.to_csv(FAILURE_CSV, index=False)
     metrics_df.to_csv(METRICS_CSV, index=False)
+    if SAVE_PACKET_SDN_TIMESERIES and not summary_ts_df.empty:
+        summary_ts_df.to_csv(TIMESERIES_CSV, index=False)
+    if SAVE_PACKET_SDN_TIMESERIES and not failure_ts_df.empty:
+        failure_ts_df.to_csv(FAILURE_TIMESERIES_CSV, index=False)
 
     create_plots(summary_df, failure_df)
     build_report(helper, summary_df, failure_df, metrics_df)

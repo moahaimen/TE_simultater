@@ -166,6 +166,10 @@ DO_NO_HARM_FALLBACK_COOLDOWN = int(os.environ.get("GNNPLUS_DO_NO_HARM_FALLBACK_C
 DO_NO_HARM_OVERLAP_SKIP = float(os.environ.get("GNNPLUS_DO_NO_HARM_OVERLAP_SKIP", "0.90"))
 STICKY_EPS = float(os.environ.get("GNNPLUS_STICKY_EPS", "0.0"))
 DISTURB_TIEBREAK_EPS = float(os.environ.get("GNNPLUS_DISTURB_TIEBREAK_EPS", "0.0"))
+# Failure-time do-no-harm: compute bottleneck baseline's failure recovery and
+# use it when GNN+'s recovery MLU is worse. This guards against regressions
+# under link-removal scenarios. Default ON.
+FAILURE_DO_NO_HARM = os.environ.get("GNNPLUS_FAILURE_DO_NO_HARM", "1") == "1"
 CALIBRATION_MAX_SAMPLES_PER_TOPO = int(os.environ.get("GNNPLUS_CALIBRATION_MAX_SAMPLES_PER_TOPO", "200"))
 SUP_LP_GAP_MEAN_GATE = float(os.environ.get("GNNPLUS_SUP_LP_GAP_MEAN_GATE", "0.03"))
 SUP_LP_GAP_P95_GATE = float(os.environ.get("GNNPLUS_SUP_LP_GAP_P95_GATE", "0.06"))
@@ -201,8 +205,8 @@ ALL_TOPOLOGIES = KNOWN_TOPOLOGIES + UNSEEN_TOPOLOGIES
 CORE_METHODS = ["ecmp", "bottleneck", "gnn", "gnnplus"]
 RL_FAILURE_SCENARIOS = [
     "single_link_failure",
-    "random_link_failure_1",
-    "random_link_failure_2",
+    "multiple_link_failure",
+    "three_link_failure",
     "capacity_degradation_50",
     "traffic_spike_2x",
 ]
@@ -270,9 +274,13 @@ AUDIT_MD = OUTPUT_DIR / "experiment_audit.md"
 SUMMARY_CSV = OUTPUT_DIR / "packet_sdn_summary.csv"
 FAILURE_CSV = OUTPUT_DIR / "packet_sdn_failure.csv"
 SDN_METRICS_CSV = OUTPUT_DIR / "packet_sdn_sdn_metrics.csv"
+TIMESERIES_CSV = OUTPUT_DIR / "packet_sdn_timeseries.csv"
+FAILURE_TIMESERIES_CSV = OUTPUT_DIR / "packet_sdn_failure_timeseries.csv"
 SPLIT_MANIFEST_JSON = OUTPUT_DIR / "split_manifest.json"
 PROPORTIONAL_SUMMARY_CSV = OUTPUT_DIR / "proportional_budget_summary.csv"
 PROPORTIONAL_STRESS_CSV = OUTPUT_DIR / "proportional_budget_extreme_stress.csv"
+SAVE_PACKET_SDN_TIMESERIES = os.environ.get("GNNPLUS_SAVE_PACKET_SDN_TIMESERIES", "0") == "1"
+SKIP_PROPORTIONAL_STUDY = os.environ.get("GNNPLUS_SKIP_PROPORTIONAL_STUDY", "0") == "1"
 
 SUP_CKPT = TRAIN_DIR / "gnn_plus_supervised_improved.pt"
 FINAL_CKPT = TRAIN_DIR / "gnn_plus_improved_fixedk40.pt"
@@ -864,12 +872,16 @@ def canonical_failure_type(sample: dict) -> str:
     scenario = str(sample.get("scenario", "normal")).strip().lower()
     if scenario in {
         "single_link_failure",
-        "random_link_failure_1",
-        "random_link_failure_2",
+        "multiple_link_failure",
+        "three_link_failure",
         "capacity_degradation_50",
         "traffic_spike_2x",
     }:
         return scenario
+    if scenario == "random_link_failure_1":
+        return "random_link_failure_1"
+    if scenario == "random_link_failure_2":
+        return "multiple_link_failure"
     if scenario.startswith("synthetic_failure"):
         return "synthetic_failure_misc"
     if sample_has_active_failure(sample):
@@ -3040,6 +3052,7 @@ def calibrate_inference_controls(model: GNNPlusFlowSelector, val_samples: list[d
 
 _STICKY_OVERRIDE_LOGGED = False
 _DISTURB_TIEBREAK_LOGGED = False
+_FAILURE_FALLBACK_LOGGED = False
 
 
 def _sticky_compose_selection(
@@ -3555,10 +3568,64 @@ def run_failure_scenario_gnnplus_improved(
     post_routing = apply_routing(effective_tm, recovery_splits, effective_path_library, effective_caps)
     post_recovery_mlu = float(post_routing.mlu)
     select_info.update(gate_info)
+
+    # [Phase 1 / failure-rescue] Failure-time do-no-harm fallback: compute
+    # the bottleneck recovery on the SAME failure state and fall back if
+    # GNN+'s recovery MLU is worse. Same philosophy as the normal-cycle
+    # do-no-harm gate. We use the already-built `effective_*` state (so
+    # the bottleneck candidate is evaluated on identical failed edges and
+    # capacities as GNN+), not a fresh random failure state. Inference-only.
+    select_info["failure_do_no_harm_fallback"] = False
+    if FAILURE_DO_NO_HARM:
+        try:
+            bn_t_start = time.perf_counter()
+            bn_selected = select_bottleneck_critical(
+                effective_tm,
+                effective_ecmp,
+                effective_path_library,
+                effective_caps,
+                K_CRIT,
+            )
+            bn_lp = runner.solve_selected_path_lp_safe(
+                tm_vector=effective_tm,
+                selected_ods=bn_selected,
+                base_splits=effective_ecmp,
+                path_library=effective_path_library,
+                capacities=effective_caps,
+                time_limit_sec=LP_TIME_LIMIT,
+                context=f"{dataset.key}:{scenario}:bottleneck_failure_fallback",
+            )
+            bn_recovery_ms_local = (time.perf_counter() - bn_t_start) * 1000.0
+            bn_post_routing = apply_routing(
+                effective_tm,
+                bn_lp.splits,
+                effective_path_library,
+                effective_caps,
+            )
+            bn_post_mlu = float(bn_post_routing.mlu)
+            if bn_post_mlu + 1e-12 < float(post_recovery_mlu):
+                global _FAILURE_FALLBACK_LOGGED
+                if not _FAILURE_FALLBACK_LOGGED:
+                    print(
+                        f"[failure-do-no-harm] Falling back to bottleneck recovery: "
+                        f"gnn_mlu={post_recovery_mlu:.6f} bn_mlu={bn_post_mlu:.6f} "
+                        f"context={dataset.key}:{scenario}. First fallback only is logged.",
+                        flush=True,
+                    )
+                    _FAILURE_FALLBACK_LOGGED = True
+                post_recovery_mlu = bn_post_mlu
+                # Honest accounting: include both inference paths in the
+                # reported recovery time (GNN+'s wasted compute + bottleneck).
+                recovery_ms = float(recovery_ms) + float(bn_recovery_ms_local)
+                select_info["failure_do_no_harm_fallback"] = True
+        except Exception:
+            # Fallback is best-effort; never fail the cycle if it errors.
+            pass
+
     return recovery_ms, pre_failure_mlu, post_recovery_mlu, failure_mask, select_info
 
 
-def benchmark_topology_normal_improved(runner, topo_key: str, gnn_cache: dict, gnnplus_model, inference_calibration=None) -> list[dict]:
+def benchmark_topology_normal_improved(runner, topo_key: str, gnn_cache: dict, gnnplus_model, inference_calibration=None) -> tuple[list[dict], list[dict]]:
     dataset, path_library = runner.load_dataset(topo_key)
     capacities = np.asarray(dataset.capacities, dtype=float)
     weights = np.asarray(dataset.weights, dtype=float)
@@ -3571,9 +3638,10 @@ def benchmark_topology_normal_improved(runner, topo_key: str, gnn_cache: dict, g
         gnn_cache[topo_key] = gnn_model
 
     rows = []
+    ts_rows = []
     for method in CORE_METHODS:
         run_results = defaultdict(list)
-        for _ in range(NUM_RUNS):
+        for run_id in range(NUM_RUNS):
             current_splits = [s.copy() for s in ecmp_base]
             current_groups, _ = runner.build_ecmp_baseline_rules(path_library, topo_mapping, dataset.edges)
             prev_latency = None
@@ -3632,11 +3700,33 @@ def benchmark_topology_normal_improved(runner, topo_key: str, gnn_cache: dict, g
                 run_results["flow_updates"].append(result.flow_table_updates)
                 run_results["rule_delays"].append(result.rule_install_delay_ms)
                 if method == "gnnplus":
-                    run_results["do_no_harm_fallbacks"].append(
-                        float(bool(gnnplus_state.get("select_info", {}).get("do_no_harm_fallback", False)))
-                    )
+                    do_no_harm_fallback = float(bool(gnnplus_state.get("select_info", {}).get("do_no_harm_fallback", False)))
+                    run_results["do_no_harm_fallbacks"].append(do_no_harm_fallback)
                 else:
-                    run_results["do_no_harm_fallbacks"].append(0.0)
+                    do_no_harm_fallback = 0.0
+                    run_results["do_no_harm_fallbacks"].append(do_no_harm_fallback)
+                if SAVE_PACKET_SDN_TIMESERIES:
+                    ts_rows.append(
+                        {
+                            "topology": topo_key,
+                            "status": "known" if topo_key in KNOWN_TOPOLOGIES else "unseen",
+                            "method": method,
+                            "scenario": "normal",
+                            "run_id": int(run_id),
+                            "timestep": int(t_idx),
+                            "mlu": float(result.post_mlu),
+                            "disturbance": float(result.disturbance),
+                            "throughput": float(result.throughput),
+                            "mean_latency_au": float(result.mean_latency),
+                            "p95_latency_au": float(result.p95_latency),
+                            "packet_loss": float(result.packet_loss),
+                            "jitter_au": float(result.jitter),
+                            "decision_time_ms": float(result.decision_time_ms),
+                            "flow_table_updates": float(result.flow_table_updates),
+                            "rule_install_delay_ms": float(result.rule_install_delay_ms),
+                            "do_no_harm_fallback": float(do_no_harm_fallback),
+                        }
+                    )
 
         row = {
             "topology": topo_key,
@@ -3659,10 +3749,10 @@ def benchmark_topology_normal_improved(runner, topo_key: str, gnn_cache: dict, g
         }
         rows.append(row)
         print(f"[eval:normal] {topo_key} {method} mean_mlu={row['mean_mlu']:.4f}", flush=True)
-    return rows
+    return rows, ts_rows
 
 
-def benchmark_topology_failures_improved(runner, topo_key: str, gnn_cache: dict, gnnplus_model, inference_calibration=None) -> list[dict]:
+def benchmark_topology_failures_improved(runner, topo_key: str, gnn_cache: dict, gnnplus_model, inference_calibration=None) -> tuple[list[dict], list[dict]]:
     dataset, path_library = runner.load_dataset(topo_key)
     capacities = np.asarray(dataset.capacities, dtype=float)
     weights = np.asarray(dataset.weights, dtype=float)
@@ -3674,6 +3764,7 @@ def benchmark_topology_failures_improved(runner, topo_key: str, gnn_cache: dict,
     test_indices = list(range(int(dataset.split["test_start"]), dataset.tm.shape[0]))
 
     rows = []
+    ts_rows = []
     for scenario in runner.FAILURE_SCENARIOS:
         if scenario == "normal":
             continue
@@ -3695,7 +3786,8 @@ def benchmark_topology_failures_improved(runner, topo_key: str, gnn_cache: dict,
                         gnnplus_model=gnnplus_model,
                         inference_calibration=inference_calibration,
                     )
-                    run_results["do_no_harm_fallbacks"].append(float(bool(select_info.get("do_no_harm_fallback", False))))
+                    do_no_harm_fallback = float(bool(select_info.get("do_no_harm_fallback", False)))
+                    run_results["do_no_harm_fallbacks"].append(do_no_harm_fallback)
                 else:
                     recovery_ms, pre_mlu, post_mlu, _ = runner.run_failure_scenario(
                         scenario=scenario,
@@ -3710,10 +3802,25 @@ def benchmark_topology_failures_improved(runner, topo_key: str, gnn_cache: dict,
                         gnn_model=gnn_model,
                         gnnplus_model=None,
                     )
-                    run_results["do_no_harm_fallbacks"].append(0.0)
+                    do_no_harm_fallback = 0.0
+                    run_results["do_no_harm_fallbacks"].append(do_no_harm_fallback)
                 run_results["recovery_times"].append(recovery_ms)
                 run_results["pre_mlus"].append(pre_mlu)
                 run_results["post_mlus"].append(post_mlu)
+                if SAVE_PACKET_SDN_TIMESERIES:
+                    ts_rows.append(
+                        {
+                            "topology": topo_key,
+                            "status": "known" if topo_key in KNOWN_TOPOLOGIES else "unseen",
+                            "method": method,
+                            "scenario": scenario,
+                            "timestep": int(t_idx),
+                            "pre_failure_mlu": float(pre_mlu),
+                            "post_recovery_mlu": float(post_mlu),
+                            "failure_recovery_ms": float(recovery_ms),
+                            "do_no_harm_fallback": float(do_no_harm_fallback),
+                        }
+                    )
 
             row = {
                 "topology": topo_key,
@@ -3729,7 +3836,7 @@ def benchmark_topology_failures_improved(runner, topo_key: str, gnn_cache: dict,
             }
             rows.append(row)
             print(f"[eval:failure] {topo_key} {scenario} {method} mean_mlu={row['mean_mlu']:.4f}", flush=True)
-    return rows
+    return rows, ts_rows
 
 
 def proportional_budget_k(tm_vector: np.ndarray, path_library, ratio: float) -> int:
@@ -4451,6 +4558,11 @@ def build_report(summary_df: pd.DataFrame, failure_df: pd.DataFrame, metrics_df:
     helper.add_dataframe_table(doc, improvements, font_size=9)
 
     doc.add_heading("3. Training Summary", level=1)
+    supervised_losses = training_summary["supervised"].get("losses", {})
+    pl_start = supervised_losses.get("plackett_luce_weight_start")
+    pl_end = supervised_losses.get("plackett_luce_weight_end")
+    pl_ramp = supervised_losses.get("plackett_luce_ramp_epochs")
+    pl_schedule_value = "N/A" if (pl_start is None or pl_end is None or pl_ramp is None) else f"{pl_start} -> {pl_end} (epochs 1-{pl_ramp})"
     train_rows_list = [
         {"Field": "Base checkpoint", "Value": training_summary["base_checkpoint"]},
         {"Field": "Final checkpoint", "Value": training_summary["final_checkpoint"]},
@@ -4472,11 +4584,7 @@ def build_report(summary_df: pd.DataFrame, failure_df: pd.DataFrame, metrics_df:
         {"Field": "LP teacher weight", "Value": training_summary["supervised"]["lp_teacher_weight"]},
         {
             "Field": "Plackett-Luce weight schedule",
-            "Value": (
-                f"{training_summary['supervised']['losses']['plackett_luce_weight_start']}"
-                f" -> {training_summary['supervised']['losses']['plackett_luce_weight_end']}"
-                f" (epochs 1-{training_summary['supervised']['losses']['plackett_luce_ramp_epochs']})"
-            ),
+            "Value": pl_schedule_value,
         },
         {"Field": "Bottleneck aux weight", "Value": training_summary["supervised"]["losses"]["bottleneck_aux_weight"]},
         {"Field": "Prefilter recall weight", "Value": training_summary["supervised"]["losses"]["prefilter_recall_weight"]},
@@ -5024,32 +5132,38 @@ def main() -> int:
 
     gnn_cache = {}
     normal_rows = []
+    normal_ts_rows = []
     for topo in ALL_TOPOLOGIES:
-        normal_rows.extend(
-            benchmark_topology_normal_improved(
-                runner,
-                topo,
-                gnn_cache,
-                improved_model,
-                inference_calibration=inference_calibration,
-            )
+        topo_rows, topo_ts_rows = benchmark_topology_normal_improved(
+            runner,
+            topo,
+            gnn_cache,
+            improved_model,
+            inference_calibration=inference_calibration,
         )
+        normal_rows.extend(topo_rows)
+        normal_ts_rows.extend(topo_ts_rows)
     summary_df = pd.DataFrame(normal_rows)
     summary_df.to_csv(SUMMARY_CSV, index=False)
+    if SAVE_PACKET_SDN_TIMESERIES and normal_ts_rows:
+        pd.DataFrame(normal_ts_rows).to_csv(TIMESERIES_CSV, index=False)
 
     failure_rows = []
+    failure_ts_rows = []
     for topo in ALL_TOPOLOGIES:
-        failure_rows.extend(
-            benchmark_topology_failures_improved(
-                runner,
-                topo,
-                gnn_cache,
-                improved_model,
-                inference_calibration=inference_calibration,
-            )
+        topo_rows, topo_ts_rows = benchmark_topology_failures_improved(
+            runner,
+            topo,
+            gnn_cache,
+            improved_model,
+            inference_calibration=inference_calibration,
         )
+        failure_rows.extend(topo_rows)
+        failure_ts_rows.extend(topo_ts_rows)
     failure_df = pd.DataFrame(failure_rows)
     failure_df.to_csv(FAILURE_CSV, index=False)
+    if SAVE_PACKET_SDN_TIMESERIES and failure_ts_rows:
+        pd.DataFrame(failure_ts_rows).to_csv(FAILURE_TIMESERIES_CSV, index=False)
 
     metrics_df = prepare_sdn_metrics(summary_df, failure_df)
     metrics_df.to_csv(SDN_METRICS_CSV, index=False)
@@ -5089,29 +5203,34 @@ def main() -> int:
         training_summary["reused_from"] = reused_training_summary.get("reused_from", str(PREVIOUS_OUTPUT_DIR.relative_to(PROJECT_ROOT)))
     TRAINING_SUMMARY_JSON.write_text(json.dumps(training_summary, indent=2) + "\n", encoding="utf-8")
 
-    proportional_rows = []
-    for topo in ALL_TOPOLOGIES:
-        proportional_rows.extend(
-            benchmark_proportional_budget_normal(
+    if SKIP_PROPORTIONAL_STUDY:
+        proportional_df = pd.read_csv(PROPORTIONAL_SUMMARY_CSV) if PROPORTIONAL_SUMMARY_CSV.exists() else pd.DataFrame()
+        proportional_stress_df = pd.read_csv(PROPORTIONAL_STRESS_CSV) if PROPORTIONAL_STRESS_CSV.exists() else pd.DataFrame()
+        print("[main] skipping proportional-budget study; reusing existing CSVs when available.", flush=True)
+    else:
+        proportional_rows = []
+        for topo in ALL_TOPOLOGIES:
+            proportional_rows.extend(
+                benchmark_proportional_budget_normal(
+                    runner,
+                    topo,
+                    improved_model,
+                    PROPORTIONAL_BUDGET_RATIO,
+                    inference_calibration=inference_calibration,
+                )
+            )
+        proportional_df = pd.DataFrame(proportional_rows)
+        proportional_df.to_csv(PROPORTIONAL_SUMMARY_CSV, index=False)
+
+        proportional_stress_df = pd.DataFrame(
+            benchmark_extreme_stress_vtlwavenet(
                 runner,
-                topo,
                 improved_model,
-                PROPORTIONAL_BUDGET_RATIO,
+                EXTREME_STRESS_RATIO,
                 inference_calibration=inference_calibration,
             )
         )
-    proportional_df = pd.DataFrame(proportional_rows)
-    proportional_df.to_csv(PROPORTIONAL_SUMMARY_CSV, index=False)
-
-    proportional_stress_df = pd.DataFrame(
-        benchmark_extreme_stress_vtlwavenet(
-            runner,
-            improved_model,
-            EXTREME_STRESS_RATIO,
-            inference_calibration=inference_calibration,
-        )
-    )
-    proportional_stress_df.to_csv(PROPORTIONAL_STRESS_CSV, index=False)
+        proportional_stress_df.to_csv(PROPORTIONAL_STRESS_CSV, index=False)
 
     comparison_paths = build_comparison_tables(summary_df, failure_df)
     build_report(summary_df, failure_df, metrics_df, training_summary, split_manifest)

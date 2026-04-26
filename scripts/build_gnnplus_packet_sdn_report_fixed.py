@@ -95,16 +95,16 @@ TOPOLOGY_DISPLAY = {
 }
 SCENARIO_ORDER = [
     "single_link_failure",
-    "random_link_failure_1",
-    "random_link_failure_2",
+    "multiple_link_failure",
+    "three_link_failure",
     "capacity_degradation_50",
     "traffic_spike_2x",
 ]
 SCENARIO_LABELS = {
     "normal": "Normal",
     "single_link_failure": "Single Link Failure",
-    "random_link_failure_1": "Random Link Failure (1)",
-    "random_link_failure_2": "Random Link Failure (2)",
+    "multiple_link_failure": "Multiple Link Failure (2 Links)",
+    "three_link_failure": "3-Link Failure",
     "capacity_degradation_50": "Capacity Degradation (50%)",
     "traffic_spike_2x": "Traffic Spike (2x)",
 }

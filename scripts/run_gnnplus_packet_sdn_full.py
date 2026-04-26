@@ -81,8 +81,8 @@ PAPER_BASELINES = ["flexdate", "flexentry", "erodrl"]
 FAILURE_SCENARIOS = [
     "normal",
     "single_link_failure",  # highest utilization link
-    "random_link_failure_1",  # random single link
-    "random_link_failure_2",  # two random links
+    "multiple_link_failure",  # two random links
+    "three_link_failure",  # three random links
     "capacity_degradation_50",
     "traffic_spike_2x"
 ]
@@ -346,8 +346,10 @@ def _build_failure_execution_state(
         failed_edges = [fail_idx]
     elif scenario == "random_link_failure_1":
         failed_edges = [random.randint(0, len(capacities) - 1)]
-    elif scenario == "random_link_failure_2":
+    elif scenario in {"multiple_link_failure", "random_link_failure_2"}:
         failed_edges = random.sample(range(len(capacities)), min(2, len(capacities)))
+    elif scenario == "three_link_failure":
+        failed_edges = random.sample(range(len(capacities)), min(3, len(capacities)))
     elif scenario == "capacity_degradation_50":
         util = np.asarray(normal_routing.utilization)
         degraded = np.where(util > 0.5)[0].tolist()

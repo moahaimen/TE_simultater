@@ -72,8 +72,11 @@ def run_failure_scenario_all_methods(
     elif scenario == "random_link_failure_1":
         fail_idx = base.random.randint(0, len(capacities) - 1)
         failure_mask[fail_idx] = 0.0
-    elif scenario == "random_link_failure_2":
+    elif scenario in {"multiple_link_failure", "random_link_failure_2"}:
         for idx in base.random.sample(range(len(capacities)), min(2, len(capacities))):
+            failure_mask[idx] = 0.0
+    elif scenario == "three_link_failure":
+        for idx in base.random.sample(range(len(capacities)), min(3, len(capacities))):
             failure_mask[idx] = 0.0
     elif scenario == "capacity_degradation_50":
         util = np.asarray(normal_routing.utilization)
