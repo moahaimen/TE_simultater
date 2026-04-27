@@ -341,15 +341,24 @@ def _build_failure_execution_state(
     effective_weights = np.asarray(weights, dtype=float)
     effective_dataset = dataset
 
+    # Deterministic per-(topology, scenario, tm) seed for the random scenarios
+    # (random_link_failure_1, multiple_link_failure, three_link_failure). This
+    # ensures every method (ECMP/OSPF/Bottleneck/GNN+/...) sees the *same*
+    # failed-edge sample per call — critical for fair win/tie comparisons that
+    # use the mean across t_idx samples. Seeding only the local Random to
+    # avoid disturbing the global stream used elsewhere.
+    _rng_seed = abs(hash((str(getattr(dataset, "key", "")), str(scenario), bytes(np.asarray(tm_vector, dtype=np.float64).tobytes())))) % (2**31)
+    _local_rng = random.Random(_rng_seed)
+
     if scenario == "single_link_failure":
         fail_idx = int(np.argmax(np.asarray(normal_routing.utilization)))
         failed_edges = [fail_idx]
     elif scenario == "random_link_failure_1":
-        failed_edges = [random.randint(0, len(capacities) - 1)]
+        failed_edges = [_local_rng.randint(0, len(capacities) - 1)]
     elif scenario in {"multiple_link_failure", "random_link_failure_2"}:
-        failed_edges = random.sample(range(len(capacities)), min(2, len(capacities)))
+        failed_edges = _local_rng.sample(range(len(capacities)), min(2, len(capacities)))
     elif scenario == "three_link_failure":
-        failed_edges = random.sample(range(len(capacities)), min(3, len(capacities)))
+        failed_edges = _local_rng.sample(range(len(capacities)), min(3, len(capacities)))
     elif scenario == "capacity_degradation_50":
         util = np.asarray(normal_routing.utilization)
         degraded = np.where(util > 0.5)[0].tolist()

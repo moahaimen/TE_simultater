@@ -4601,9 +4601,9 @@ def build_report(summary_df: pd.DataFrame, failure_df: pd.DataFrame, metrics_df:
             [
                 {"Field": "RL learning rate", "Value": training_summary["reinforce"]["rl_config"]["lr"]},
                 {"Field": "RL entropy weight", "Value": training_summary["reinforce"]["rl_config"]["entropy_weight"]},
-                {"Field": "RL KL beta start", "Value": training_summary["reinforce"]["step5_patch"]["rl_kl_beta_start"]},
-                {"Field": "RL KL beta end", "Value": training_summary["reinforce"]["step5_patch"]["rl_kl_beta_end"]},
-                {"Field": "Disturbance churn multiplier", "Value": training_summary["reinforce"]["step5_patch"]["disturbance_churn_multiplier"]},
+                {"Field": "RL KL beta start", "Value": training_summary["reinforce"].get("step5_patch", {}).get("rl_kl_beta_start", "n/a")},
+                {"Field": "RL KL beta end", "Value": training_summary["reinforce"].get("step5_patch", {}).get("rl_kl_beta_end", "n/a")},
+                {"Field": "Disturbance churn multiplier", "Value": training_summary["reinforce"].get("step5_patch", {}).get("disturbance_churn_multiplier", "n/a")},
                 {"Field": "Reward w_mlu (legacy)", "Value": training_summary["reinforce"]["rl_config"]["w_reward_mlu"]},
                 {"Field": "Reward w_mlu normal", "Value": training_summary["reinforce"]["rl_config"]["w_reward_mlu_normal"]},
                 {"Field": "Reward w_mlu failure", "Value": training_summary["reinforce"]["rl_config"]["w_reward_mlu_failure"]},
