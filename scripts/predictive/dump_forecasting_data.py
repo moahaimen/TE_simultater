@@ -42,33 +42,34 @@ ALL_TOPOLOGIES = [
 
 
 def compute_ecmp_link_util(dataset, path_library) -> np.ndarray:
-    """Per-cycle link utilization under ECMP. Returns (num_steps, num_edges)."""
-    num_steps = dataset.tm.shape[0]
+    """Per-cycle link utilization under ECMP. Returns (num_steps, num_edges).
+
+    PathLibrary exposes edge_idx_paths_by_od: list of OD entries, each being
+    a list of paths, each being a list of edge-indices into dataset.edges.
+    Under ECMP, demand[OD] is split equally across the available paths.
+    """
     num_edges = len(dataset.edges)
     capacities = np.asarray(dataset.capacities, dtype=np.float64)
+    num_od = len(dataset.od_pairs)
 
-    # Build OD -> path-list map. ECMP splits demand equally over shortest paths.
-    # We use the path_library which already provides per-OD paths.
-    edge_to_idx = {edge: i for i, edge in enumerate(dataset.edges)}
+    edge_idx_paths_by_od = getattr(path_library, "edge_idx_paths_by_od", None)
+    if edge_idx_paths_by_od is None:
+        raise AttributeError(
+            f"PathLibrary missing edge_idx_paths_by_od (have: {dir(path_library)})"
+        )
 
-    # Per-OD ECMP edge-share: how much of demand[OD] flows on each edge.
-    od_edge_share = np.zeros((len(dataset.od_pairs), num_edges), dtype=np.float64)
-    for od_idx, _ in enumerate(dataset.od_pairs):
-        try:
-            paths = path_library.paths_for_od(od_idx)
-        except AttributeError:
-            paths = path_library.get_paths(od_idx) if hasattr(path_library, "get_paths") else []
+    od_edge_share = np.zeros((num_od, num_edges), dtype=np.float64)
+    for od_idx in range(num_od):
+        paths = edge_idx_paths_by_od[od_idx] if od_idx < len(edge_idx_paths_by_od) else []
         if not paths:
             continue
         share = 1.0 / len(paths)
-        for path in paths:
-            edges_on_path = path.edges if hasattr(path, "edges") else path
-            for edge in edges_on_path:
-                eidx = edge_to_idx.get(edge if isinstance(edge, tuple) else tuple(edge))
-                if eidx is not None:
-                    od_edge_share[od_idx, eidx] += share
+        for path_edge_indices in paths:
+            for eidx in path_edge_indices:
+                if 0 <= int(eidx) < num_edges:
+                    od_edge_share[od_idx, int(eidx)] += share
 
-    # Per-cycle util: (num_steps, num_od) @ (num_od, num_edges) / (num_edges,)
+    # Per-cycle util: (num_steps, num_od) @ (num_od, num_edges) / capacities
     link_loads = dataset.tm @ od_edge_share              # (num_steps, num_edges)
     link_util = link_loads / np.maximum(capacities, 1e-9)
     return link_util.astype(np.float64)

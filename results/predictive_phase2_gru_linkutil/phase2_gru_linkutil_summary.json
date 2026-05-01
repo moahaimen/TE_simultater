@@ -1,0 +1,226 @@
+[
+  {
+    "topology": "abilene",
+    "num_links": 30,
+    "n_test": 75,
+    "train_seconds": 1.7,
+    "best_val_mape_pct": 5.683,
+    "gru": {
+      "mape_pct": 6.997,
+      "mae": 0.002229684454326266,
+      "r2": 0.9939,
+      "hotspot_f1": 0.0
+    },
+    "last_value": {
+      "mape_pct": 7.231,
+      "mae": 0.0020868333424522187,
+      "r2": 0.9951,
+      "hotspot_f1": 0.0
+    },
+    "rel_improvement_pct": 3.24,
+    "config": {
+      "window": 12,
+      "hidden": 64,
+      "layers": 2,
+      "epochs_run": 55,
+      "lr": 0.001,
+      "batch_size": 32
+    }
+  },
+  {
+    "topology": "cernet",
+    "num_links": 116,
+    "n_test": 75,
+    "train_seconds": 2.5,
+    "best_val_mape_pct": 1.233,
+    "gru": {
+      "mape_pct": 1.271,
+      "mae": 5.86806466493828,
+      "r2": 0.9996,
+      "hotspot_f1": 1.0
+    },
+    "last_value": {
+      "mape_pct": 1.732,
+      "mae": 8.437687926953785,
+      "r2": 0.9991,
+      "hotspot_f1": 1.0
+    },
+    "rel_improvement_pct": 26.6,
+    "config": {
+      "window": 12,
+      "hidden": 64,
+      "layers": 2,
+      "epochs_run": 80,
+      "lr": 0.001,
+      "batch_size": 32
+    }
+  },
+  {
+    "topology": "ebone",
+    "num_links": 76,
+    "n_test": 75,
+    "train_seconds": 2.2,
+    "best_val_mape_pct": 1.437,
+    "gru": {
+      "mape_pct": 1.449,
+      "mae": 3.379818439983456,
+      "r2": 0.9976,
+      "hotspot_f1": 1.0
+    },
+    "last_value": {
+      "mape_pct": 1.784,
+      "mae": 4.191723746885335,
+      "r2": 0.9965,
+      "hotspot_f1": 1.0
+    },
+    "rel_improvement_pct": 18.76,
+    "config": {
+      "window": 12,
+      "hidden": 64,
+      "layers": 2,
+      "epochs_run": 74,
+      "lr": 0.001,
+      "batch_size": 32
+    }
+  },
+  {
+    "topology": "geant",
+    "num_links": 72,
+    "n_test": 75,
+    "train_seconds": 0.5,
+    "best_val_mape_pct": 4.721,
+    "gru": {
+      "mape_pct": 5.129,
+      "mae": 0.0021004244480049786,
+      "r2": 0.9962,
+      "hotspot_f1": 0.0
+    },
+    "last_value": {
+      "mape_pct": 5.272,
+      "mae": 0.002160082558084963,
+      "r2": 0.996,
+      "hotspot_f1": 0.0
+    },
+    "rel_improvement_pct": 2.72,
+    "config": {
+      "window": 12,
+      "hidden": 64,
+      "layers": 2,
+      "epochs_run": 16,
+      "lr": 0.001,
+      "batch_size": 32
+    }
+  },
+  {
+    "topology": "sprintlink",
+    "num_links": 166,
+    "n_test": 75,
+    "train_seconds": 1.8,
+    "best_val_mape_pct": 1.075,
+    "gru": {
+      "mape_pct": 1.088,
+      "mae": 4.527905548248562,
+      "r2": 0.9988,
+      "hotspot_f1": 1.0
+    },
+    "last_value": {
+      "mape_pct": 1.578,
+      "mae": 6.5957268959413105,
+      "r2": 0.9975,
+      "hotspot_f1": 1.0
+    },
+    "rel_improvement_pct": 31.05,
+    "config": {
+      "window": 12,
+      "hidden": 64,
+      "layers": 2,
+      "epochs_run": 57,
+      "lr": 0.001,
+      "batch_size": 32
+    }
+  },
+  {
+    "topology": "tiscali",
+    "num_links": 172,
+    "n_test": 75,
+    "train_seconds": 1.6,
+    "best_val_mape_pct": 1.0,
+    "gru": {
+      "mape_pct": 1.022,
+      "mae": 5.515354542616266,
+      "r2": 0.9988,
+      "hotspot_f1": 1.0
+    },
+    "last_value": {
+      "mape_pct": 1.569,
+      "mae": 8.55603721463896,
+      "r2": 0.9972,
+      "hotspot_f1": 1.0
+    },
+    "rel_improvement_pct": 34.9,
+    "config": {
+      "window": 12,
+      "hidden": 64,
+      "layers": 2,
+      "epochs_run": 52,
+      "lr": 0.001,
+      "batch_size": 32
+    }
+  },
+  {
+    "topology": "germany50",
+    "num_links": 176,
+    "n_test": 44,
+    "train_seconds": 0.4,
+    "best_val_mape_pct": 14.566,
+    "gru": {
+      "mape_pct": 221214.379,
+      "mae": 0.2558414651210485,
+      "r2": 0.9196,
+      "hotspot_f1": 0.974
+    },
+    "last_value": {
+      "mape_pct": 222480.963,
+      "mae": 0.2556093556822535,
+      "r2": 0.9178,
+      "hotspot_f1": 0.9733
+    },
+    "rel_improvement_pct": 0.57,
+    "config": {
+      "window": 12,
+      "hidden": 64,
+      "layers": 2,
+      "epochs_run": 23,
+      "lr": 0.001,
+      "batch_size": 32
+    }
+  },
+  {
+    "topology": "vtlwavenet2011",
+    "num_links": 192,
+    "n_test": 75,
+    "train_seconds": 1.0,
+    "best_val_mape_pct": 0.524,
+    "gru": {
+      "mape_pct": 0.703,
+      "mae": 81.28482470265037,
+      "r2": 0.9994,
+      "hotspot_f1": 1.0
+    },
+    "last_value": {
+      "mape_pct": 1.286,
+      "mae": 143.80532157394214,
+      "r2": 0.9984,
+      "hotspot_f1": 1.0
+    },
+    "rel_improvement_pct": 45.38,
+    "config": {
+      "window": 12,
+      "hidden": 64,
+      "layers": 2,
+      "epochs_run": 27,
+      "lr": 0.001,
+      "batch_size": 32
+    }
+  }
+]
