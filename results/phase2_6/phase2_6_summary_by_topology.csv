@@ -1,0 +1,9 @@
+topology,wins,ties,losses,missing,win_rate_%
+abilene,26,6,16,0,54.2
+cernet,23,0,25,0,47.9
+ebone,24,20,4,0,50.0
+geant,34,14,0,0,70.8
+germany50,32,4,12,0,66.7
+sprintlink,48,0,0,0,100.0
+tiscali,14,20,14,0,29.2
+vtlwavenet2011,35,8,5,0,72.9

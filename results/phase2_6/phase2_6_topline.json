@@ -1,0 +1,14 @@
+{
+  "n_total": 384,
+  "wins": 236,
+  "ties": 72,
+  "losses": 76,
+  "win_rate_pct": 61.5,
+  "normal_d0_total": 32,
+  "normal_d0_wins": 13,
+  "dynamic_total": 352,
+  "dynamic_wins": 223,
+  "dynamic_ties": 62,
+  "dynamic_losses": 67,
+  "dynamic_win_rate_pct": 63.4
+}

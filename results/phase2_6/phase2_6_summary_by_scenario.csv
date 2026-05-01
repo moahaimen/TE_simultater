@@ -1,0 +1,13 @@
+scenario,delay,wins,ties,losses,win_rate_%
+flash_crowd,0,12,10,10,37.5
+flash_crowd,1,23,3,6,71.9
+flash_crowd,2,25,3,4,78.1
+normal,0,13,10,9,40.6
+normal,1,22,4,6,68.8
+normal,2,25,4,3,78.1
+ramp_up,0,7,12,13,21.9
+ramp_up,1,17,7,8,53.1
+ramp_up,2,19,7,6,59.4
+spike_2x,0,14,9,9,43.8
+spike_2x,1,29,2,1,90.6
+spike_2x,2,30,1,1,93.8
