@@ -1,0 +1,218 @@
+[
+  {
+    "topology": "abilene",
+    "num_test_steps": 75,
+    "wall_seconds": 7.6,
+    "reactive": {
+      "mean_mlu": 0.054602972502504406,
+      "mean_disturbance": 0.06468813297451477,
+      "mean_decision_ms": 37.474521001180015,
+      "n": 75
+    },
+    "predictive": {
+      "mean_mlu": 0.05460297250211192,
+      "mean_disturbance": 0.06540065292032146,
+      "mean_decision_ms": 26.069307327270508,
+      "n": 75,
+      "mlu_rel_pct": -7.187972337379673e-10,
+      "disturb_rel_pct": 1.1014693314574462
+    },
+    "oracle": {
+      "mean_mlu": 0.05460297250072552,
+      "mean_disturbance": 0.06311908926245766,
+      "mean_decision_ms": 26.854346593221027,
+      "n": 75,
+      "mlu_rel_pct": -3.2578493720276548e-09,
+      "disturb_rel_pct": -2.425551086279258
+    }
+  },
+  {
+    "topology": "cernet",
+    "num_test_steps": 75,
+    "wall_seconds": 9.1,
+    "reactive": {
+      "mean_mlu": 1709.226906376226,
+      "mean_disturbance": 0.029970247243948738,
+      "mean_decision_ms": 33.26178232828776,
+      "n": 75
+    },
+    "predictive": {
+      "mean_mlu": 1709.08037148686,
+      "mean_disturbance": 0.030156595145221683,
+      "mean_decision_ms": 33.26663335164388,
+      "n": 75,
+      "mlu_rel_pct": -0.008573167718067277,
+      "disturb_rel_pct": 0.621776322884925
+    },
+    "oracle": {
+      "mean_mlu": 1709.2311955521034,
+      "mean_disturbance": 0.02963820756722751,
+      "mean_decision_ms": 33.080549240112305,
+      "n": 75,
+      "mlu_rel_pct": 0.00025094245014364185,
+      "disturb_rel_pct": -1.107897689393499
+    }
+  },
+  {
+    "topology": "ebone",
+    "num_test_steps": 75,
+    "wall_seconds": 6.7,
+    "reactive": {
+      "mean_mlu": 379.5915012829892,
+      "mean_disturbance": 0.06319368403419508,
+      "mean_decision_ms": 27.398258845011394,
+      "n": 75
+    },
+    "predictive": {
+      "mean_mlu": 379.5915012813465,
+      "mean_disturbance": 0.06277390033788924,
+      "mean_decision_ms": 27.36499786376953,
+      "n": 75,
+      "mlu_rel_pct": -4.327594153468226e-10,
+      "disturb_rel_pct": -0.6642810950516636
+    },
+    "oracle": {
+      "mean_mlu": 379.59150128289053,
+      "mean_disturbance": 0.06328256101147767,
+      "mean_decision_ms": 27.158018747965496,
+      "n": 75,
+      "mlu_rel_pct": -2.5996413199144745e-11,
+      "disturb_rel_pct": 0.1406421838525779
+    }
+  },
+  {
+    "topology": "geant",
+    "num_test_steps": 75,
+    "wall_seconds": 7.2,
+    "reactive": {
+      "mean_mlu": 0.16067404411885366,
+      "mean_disturbance": 0.19113525984915697,
+      "mean_decision_ms": 26.535863876342773,
+      "n": 75
+    },
+    "predictive": {
+      "mean_mlu": 0.16067978429527055,
+      "mean_disturbance": 0.18874935471182344,
+      "mean_decision_ms": 26.881017684936523,
+      "n": 75,
+      "mlu_rel_pct": 0.003572559867005688,
+      "disturb_rel_pct": -1.2482810022684836
+    },
+    "oracle": {
+      "mean_mlu": 0.1606797842926162,
+      "mean_disturbance": 0.19192515043707922,
+      "mean_decision_ms": 36.44960085550944,
+      "n": 75,
+      "mlu_rel_pct": 0.0035725582149971277,
+      "disturb_rel_pct": 0.4132626227864141
+    }
+  },
+  {
+    "topology": "sprintlink",
+    "num_test_steps": 75,
+    "wall_seconds": 10.2,
+    "reactive": {
+      "mean_mlu": 845.6458381356133,
+      "mean_disturbance": 0.0187375084941369,
+      "mean_decision_ms": 36.90309524536133,
+      "n": 75
+    },
+    "predictive": {
+      "mean_mlu": 845.6458381356133,
+      "mean_disturbance": 0.018659252130597465,
+      "mean_decision_ms": 36.81802113850912,
+      "n": 75,
+      "mlu_rel_pct": 0.0,
+      "disturb_rel_pct": -0.4176455133505283
+    },
+    "oracle": {
+      "mean_mlu": 845.460339559767,
+      "mean_disturbance": 0.017869705648350703,
+      "mean_decision_ms": 36.86285972595215,
+      "n": 75,
+      "mlu_rel_pct": -0.02193572858529624,
+      "disturb_rel_pct": -4.631367324304299
+    }
+  },
+  {
+    "topology": "tiscali",
+    "num_test_steps": 75,
+    "wall_seconds": 15.8,
+    "reactive": {
+      "mean_mlu": 848.2444061525048,
+      "mean_disturbance": 0.025192446625200666,
+      "mean_decision_ms": 55.93735694885254,
+      "n": 75
+    },
+    "predictive": {
+      "mean_mlu": 848.2444061525048,
+      "mean_disturbance": 0.025091185294008604,
+      "mean_decision_ms": 56.143433252970375,
+      "n": 75,
+      "mlu_rel_pct": 0.0,
+      "disturb_rel_pct": -0.40195115900639566
+    },
+    "oracle": {
+      "mean_mlu": 848.4998116940661,
+      "mean_disturbance": 0.024783800422925967,
+      "mean_decision_ms": 59.742234547932945,
+      "n": 75,
+      "mlu_rel_pct": 0.0301098998954584,
+      "disturb_rel_pct": -1.6220981167661563
+    }
+  },
+  {
+    "topology": "germany50",
+    "num_test_steps": 44,
+    "wall_seconds": 8.7,
+    "reactive": {
+      "mean_mlu": 18.93577765322935,
+      "mean_disturbance": 0.1726968585405291,
+      "mean_decision_ms": 63.58898769725453,
+      "n": 44
+    },
+    "predictive": {
+      "mean_mlu": 18.935777651438393,
+      "mean_disturbance": 0.17634300014105417,
+      "mean_decision_ms": 50.486429171128705,
+      "n": 44,
+      "mlu_rel_pct": -9.458066763446001e-09,
+      "disturb_rel_pct": 2.1112958459921125
+    },
+    "oracle": {
+      "mean_mlu": 18.9479341892537,
+      "mean_disturbance": 0.15716909416924552,
+      "mean_decision_ms": 51.68059739199552,
+      "n": 44,
+      "mlu_rel_pct": 0.06419876831557643,
+      "disturb_rel_pct": -8.9913415348198
+    }
+  },
+  {
+    "topology": "vtlwavenet2011",
+    "num_test_steps": 75,
+    "wall_seconds": 36.2,
+    "reactive": {
+      "mean_mlu": 12288.902819315283,
+      "mean_disturbance": 0.009784994464761802,
+      "mean_decision_ms": 121.81795120239258,
+      "n": 75
+    },
+    "predictive": {
+      "mean_mlu": 12288.902819314766,
+      "mean_disturbance": 0.009772824840898536,
+      "mean_decision_ms": 117.61946042378743,
+      "n": 75,
+      "mlu_rel_pct": -4.203735664627926e-12,
+      "disturb_rel_pct": -0.12437026824176364
+    },
+    "oracle": {
+      "mean_mlu": 12288.743501994417,
+      "mean_disturbance": 0.009865400872734046,
+      "mean_decision_ms": 116.03684743245442,
+      "n": 75,
+      "mlu_rel_pct": -0.0012964324253205862,
+      "disturb_rel_pct": 0.8217317675733785
+    }
+  }
+]
