@@ -1,0 +1,13 @@
+scenario,delay,wins_predictive_vs_currapg,ties,losses,win_rate_%
+flash_crowd,0,0,24,0,0.0
+flash_crowd,1,0,23,1,0.0
+flash_crowd,2,0,23,1,0.0
+normal,0,0,24,0,0.0
+normal,1,0,24,0,0.0
+normal,2,1,22,1,4.2
+ramp_up,0,0,24,0,0.0
+ramp_up,1,0,24,0,0.0
+ramp_up,2,0,23,1,0.0
+spike_2x,0,0,24,0,0.0
+spike_2x,1,1,23,0,4.2
+spike_2x,2,0,24,0,0.0

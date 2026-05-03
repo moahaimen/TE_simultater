@@ -1,0 +1,15 @@
+{
+  "n_total": 288,
+  "predictive_vs_phase1": {
+    "wins": 44,
+    "ties": 236,
+    "losses": 8
+  },
+  "current_apg_vs_phase1_wins": 43,
+  "predictive_vs_current_apg": {
+    "wins": 2,
+    "ties": 282,
+    "losses": 4,
+    "win_rate_%": 0.7
+  }
+}
